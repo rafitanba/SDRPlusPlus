@@ -4,6 +4,8 @@
 #include <utils/flog.h>
 #include <gui/gui.h>
 #include <core.h>
+#include <chrono>
+#include <cstdio>
 
 IQFrontEnd::~IQFrontEnd() {
     if (!_init) { return; }
@@ -39,6 +41,7 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
     preproc.addBlock(&conjugate, false); // TODO: Replace by parameter
 
     split.init(preproc.out);
+    split.setDiagnosticName("IQFrontEnd");
 
     // TODO: Do something to avoid basically repeating this code twice
     int skip;
@@ -138,6 +141,10 @@ void IQFrontEnd::unbindIQStream(dsp::stream<dsp::complex_t>* stream) {
 }
 
 dsp::channel::RxVFO* IQFrontEnd::addVFO(std::string name, double sampleRate, double bandwidth, double offset) {
+    const auto diagStart = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[DSP diag] addVFO begin name=%s\n", name.c_str());
+    std::fflush(stderr);
+
     // Make sure no other VFO with that name already exists
     if (vfos.find(name) != vfos.end()) {
         flog::error("[IQFrontEnd] Tried to add VFO with existing name.");
@@ -156,10 +163,20 @@ dsp::channel::RxVFO* IQFrontEnd::addVFO(std::string name, double sampleRate, dou
     // Start VFO
     vfo->start();
 
+    const auto diagUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - diagStart).count();
+    std::fprintf(stderr, "[DSP diag] addVFO end name=%s input=%p duration=%lld us\n",
+                 name.c_str(), (void*)vfoIn, (long long)diagUs);
+    std::fflush(stderr);
+
     return vfo;
 }
 
 void IQFrontEnd::removeVFO(std::string name) {
+    const auto diagStart = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[DSP diag] removeVFO begin name=%s\n", name.c_str());
+    std::fflush(stderr);
+
     // Make sure that a VFO with that name exists
     if (vfos.find(name) == vfos.end()) {
         flog::error("[IQFrontEnd] Tried to remove a VFO that doesn't exist.");
@@ -171,15 +188,33 @@ void IQFrontEnd::removeVFO(std::string name) {
     dsp::channel::RxVFO* vfo = vfos[name];
 
     // Stop the VFO
+    const auto stopStart = std::chrono::steady_clock::now();
     vfo->stop();
+    const auto stopUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - stopStart).count();
+    std::fprintf(stderr, "[DSP diag] removeVFO name=%s vfo.stop duration=%lld us input=%p\n",
+                 name.c_str(), (long long)stopUs, (void*)vfoIn);
+    std::fflush(stderr);
 
+    const auto unbindStart = std::chrono::steady_clock::now();
     unbindIQStream(vfoIn);
+    const auto unbindUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - unbindStart).count();
+    std::fprintf(stderr, "[DSP diag] removeVFO name=%s unbind duration=%lld us input=%p\n",
+                 name.c_str(), (long long)unbindUs, (void*)vfoIn);
+    std::fflush(stderr);
     vfoStreams.erase(name);
     vfos.erase(name);
 
     // Delete the VFO and its input stream
     delete vfo;
     delete vfoIn;
+
+    const auto diagUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - diagStart).count();
+    std::fprintf(stderr, "[DSP diag] removeVFO end name=%s duration=%lld us\n",
+                 name.c_str(), (long long)diagUs);
+    std::fflush(stderr);
 }
 
 void IQFrontEnd::setFFTSize(int size) {
