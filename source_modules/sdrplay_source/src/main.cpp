@@ -300,7 +300,8 @@ public:
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
             flog::warn("[SDRplay diag] ReleaseDevice after GetDeviceParams failure: {0}",
                        sdrplay_api_GetErrorString(releaseErr));
-            selectedName = "";
+            // Keep the UI/device identity on transient parameter failures.
+            // A later fresh enumeration will decide whether the device is really gone.
             return;
         }
 
@@ -311,7 +312,8 @@ public:
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
             flog::warn("[SDRplay diag] ReleaseDevice after Init failure: {0}",
                        sdrplay_api_GetErrorString(releaseErr));
-            selectedName = "";
+            // Keep the UI/device identity on transient Init failures.
+            // A later fresh enumeration will decide whether the device is really gone.
             return;
         }
         flog::info("[SDRplay diag] Device Init succeeded during selection");
