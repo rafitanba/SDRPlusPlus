@@ -77,13 +77,25 @@ void IQFrontEnd::setInput(dsp::stream<dsp::complex_t>* in) {
 }
 
 void IQFrontEnd::setSampleRate(double sampleRate) {
-    // Temp stop the necessary blocks
+    // The original code nested an outer tempStop()/tempStart() around
+    // RxVFO::setInSamplerate(), which already performs its own temporary stop.
+    // In the failing state the VFO reader remained stopped, leaving the IQ
+    // splitter blocked forever on that branch. Stop and restart every registered
+    // VFO explicitly so its reader thread is guaranteed to be alive afterwards.
     dcBlock.tempStop();
+
     for (auto& [name, vfo] : vfos) {
-        vfo->tempStop();
+        const auto stopStart = std::chrono::steady_clock::now();
+        vfo->stop();
+        const auto stopUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - stopStart).count();
+        std::fprintf(stderr,
+                     "[DSP diag] setSampleRate: stopped VFO %s in %lld us\n",
+                     name.c_str(), (long long)stopUs);
+        std::fflush(stderr);
     }
 
-    // Update the samplerate
+    // Update the samplerate while every VFO is stopped.
     _sampleRate = sampleRate;
     effectiveSr = _sampleRate / _decimRatio;
     dcBlock.setRate(genDCBlockRate(effectiveSr));
@@ -91,13 +103,21 @@ void IQFrontEnd::setSampleRate(double sampleRate) {
         vfo->setInSamplerate(effectiveSr);
     }
 
-    // Reconfigure the FFT
+    // Reconfigure the FFT.
     updateFFTPath();
 
-    // Restart blocks
+    // Restart blocks. A registered VFO is always expected to consume its input;
+    // disabled radio instances remove their VFO instead of leaving it stopped.
     dcBlock.tempStart();
     for (auto& [name, vfo] : vfos) {
-        vfo->tempStart();
+        const auto startTime = std::chrono::steady_clock::now();
+        vfo->start();
+        const auto startUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+        std::fprintf(stderr,
+                     "[DSP diag] setSampleRate: restarted VFO %s at %.0f S/s in %lld us\n",
+                     name.c_str(), effectiveSr, (long long)startUs);
+        std::fflush(stderr);
     }
 }
 
