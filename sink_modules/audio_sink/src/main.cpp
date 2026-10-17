@@ -9,6 +9,8 @@
 #include <RtAudio.h>
 #include <config.h>
 #include <core.h>
+#include <cstdio>
+#include <cstring>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -192,37 +194,98 @@ private:
         opts.flags = RTAUDIO_MINIMIZE_LATENCY;
         opts.streamName = _streamName;
 
+        std::fprintf(stderr,
+                     "[Audio diag] RtAudio start begin stream=%s sampleRate=%u\n",
+                     _streamName.c_str(), sampleRate);
+        std::fflush(stderr);
+
         try {
             audio.openStream(&parameters, NULL, RTAUDIO_FLOAT32, sampleRate, &bufferFrames, &callback, this, &opts);
             stereoPacker.setSampleCount(bufferFrames);
-            audio.startStream();
+
+            // Make sure a producer exists before CoreAudio starts invoking the
+            // callback. The previous order started the device first, allowing the
+            // callback to block on an output stream that had no running writer yet.
+            stereoPacker.out.clearReadStop();
             stereoPacker.start();
+            audio.startStream();
         }
         catch (const std::exception& e) {
+            stereoPacker.out.stopReader();
+            stereoPacker.stop();
+            stereoPacker.out.clearReadStop();
+            try { audio.closeStream(); } catch (...) {}
             flog::error("Could not open audio device {0}", e.what());
+            std::fprintf(stderr, "[Audio diag] RtAudio start failed stream=%s\n", _streamName.c_str());
+            std::fflush(stderr);
             return false;
         }
 
+        std::fprintf(stderr,
+                     "[Audio diag] RtAudio start end stream=%s bufferFrames=%u\n",
+                     _streamName.c_str(), bufferFrames);
+        std::fflush(stderr);
         flog::info("RtAudio stream open");
         return true;
     }
 
     void doStop() {
+        std::fprintf(stderr, "[Audio diag] RtAudio stop begin stream=%s\n", _streamName.c_str());
+        std::fflush(stderr);
+
+        // Wake a callback that may currently be blocked in read(). Returning 2
+        // from the callback asks RtAudio to abort immediately instead of draining.
+        monoPacker.out.stopReader();
+        stereoPacker.out.stopReader();
+        std::fprintf(stderr, "[Audio diag] RtAudio callback readers signalled\n");
+        std::fflush(stderr);
+
+        try {
+            audio.abortStream();
+            std::fprintf(stderr, "[Audio diag] RtAudio abortStream returned\n");
+            std::fflush(stderr);
+        }
+        catch (const std::exception& e) {
+            flog::warn("RtAudio abortStream failed: {0}", e.what());
+            std::fprintf(stderr, "[Audio diag] RtAudio abortStream threw: %s\n", e.what());
+            std::fflush(stderr);
+        }
+
+        // With the real-time callback stopped, it is now safe to tear down the
+        // packers and their upstream readers without waiting on CoreAudio.
         s2m.stop();
         monoPacker.stop();
         stereoPacker.stop();
-        monoPacker.out.stopReader();
-        stereoPacker.out.stopReader();
-        audio.stopStream();
-        audio.closeStream();
+        std::fprintf(stderr, "[Audio diag] RtAudio DSP packers stopped\n");
+        std::fflush(stderr);
+
+        try {
+            audio.closeStream();
+            std::fprintf(stderr, "[Audio diag] RtAudio closeStream returned\n");
+            std::fflush(stderr);
+        }
+        catch (const std::exception& e) {
+            flog::warn("RtAudio closeStream failed: {0}", e.what());
+            std::fprintf(stderr, "[Audio diag] RtAudio closeStream threw: %s\n", e.what());
+            std::fflush(stderr);
+        }
+
         monoPacker.out.clearReadStop();
         stereoPacker.out.clearReadStop();
+
+        std::fprintf(stderr, "[Audio diag] RtAudio stop end stream=%s\n", _streamName.c_str());
+        std::fflush(stderr);
     }
 
     static int callback(void* outputBuffer, void* inputBuffer, unsigned int nBufferFrames, double streamTime, RtAudioStreamStatus status, void* userData) {
         AudioSink* _this = (AudioSink*)userData;
         int count = _this->stereoPacker.out.read();
-        if (count < 0) { return 0; }
+        if (count < 0) {
+            if (outputBuffer) {
+                memset(outputBuffer, 0, nBufferFrames * sizeof(dsp::stereo_t));
+            }
+            return 2;
+        }
 
         memcpy(outputBuffer, _this->stereoPacker.out.readBuf, nBufferFrames * sizeof(dsp::stereo_t));
         _this->stereoPacker.out.flush();
