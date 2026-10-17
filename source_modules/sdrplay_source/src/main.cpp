@@ -101,7 +101,7 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] lifecycle-v5: pre-Init RSP1B config + API recovery + overload ACK + sample gaps\n");
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v6: metadata-only selection + pre-Init RSP1B config + API recovery\n");
         std::fflush(stderr);
 
         sampleRate = 2000000.0;
@@ -309,18 +309,7 @@ public:
             return;
         }
 
-        err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
-        if (err != sdrplay_api_Success) {
-            const char* errStr = sdrplay_api_GetErrorString(err);
-            flog::error("Could not init RSP device: {0}", errStr);
-            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
-            flog::warn("[SDRplay diag] ReleaseDevice after Init failure: {0}",
-                       sdrplay_api_GetErrorString(releaseErr));
-            // Keep the UI/device identity on transient Init failures.
-            // A later fresh enumeration will decide whether the device is really gone.
-            return;
-        }
-        flog::info("[SDRplay diag] Device Init succeeded during selection");
+        flog::info("[SDRplay diag] Device selection: metadata/config only; skipping Init/Uninit probe");
 
         // Define the valid samplerates
         samplerates.clear();
@@ -497,11 +486,12 @@ public:
 
         if (lnaGain >= lnaSteps) { lnaGain = lnaSteps - 1; }
 
-        // Release device after selecting
-        err = sdrplay_api_Uninit(openDev.dev);
-        flog::info("[SDRplay diag] Uninit after device selection: {0}", sdrplay_api_GetErrorString(err));
+        // Selection is metadata-only: no stream was initialized, so release directly.
         err = sdrplay_api_ReleaseDevice(&openDev);
-        flog::info("[SDRplay diag] ReleaseDevice after device selection: {0}", sdrplay_api_GetErrorString(err));
+        flog::info("[SDRplay diag] ReleaseDevice after metadata-only selection: {0}",
+                   sdrplay_api_GetErrorString(err));
+        openDevParams = nullptr;
+        channelParams = nullptr;
     }
 
     void rspDuoSelectTuner(sdrplay_api_TunerSelectT tuner, sdrplay_api_RspDuo_AmPortSelectT amPort) {
