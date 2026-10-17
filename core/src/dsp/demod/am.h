@@ -14,6 +14,7 @@ namespace dsp::demod {
     template <class T>
     class AM : public Processor<dsp::complex_t, T> {
         using base_type = Processor<dsp::complex_t, T>;
+        using SwapResult = typename stream<T>::TimedSwapResult;
     public:
         enum AGCMode {
             CARRIER,
@@ -156,11 +157,11 @@ namespace dsp::demod {
             process(count, base_type::_in->readBuf, base_type::out.writeBuf);
 
             base_type::_in->flush();
-            const auto result = base_type::out.swapFor(count, std::chrono::milliseconds(20));
-            if (result == stream<T>::TimedSwapResult::STOPPED) {
+            const SwapResult result = base_type::out.swapFor(count, std::chrono::milliseconds(20));
+            if (result == SwapResult::STOPPED) {
                 return -1;
             }
-            if (result == stream<T>::TimedSwapResult::TIMEOUT) {
+            if (result == SwapResult::TIMEOUT) {
                 outputTimeouts++;
                 if (outputTimeouts == 1 || (outputTimeouts % 200) == 0) {
                     std::fprintf(stderr,
