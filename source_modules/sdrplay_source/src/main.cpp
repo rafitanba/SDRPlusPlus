@@ -1390,7 +1390,10 @@ private:
                 const auto swapTime = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - swapStart).count();
 
-                if (!swapped || swapTime >= 20000) {
+                // bufferSize is sampleRate/200, i.e. about 5 ms of samples.
+                // Log any wait >= one full buffer period: at that point the producer is already
+                // falling behind the downstream reader.
+                if (!swapped || swapTime >= 5000) {
                     std::fprintf(stderr,
                                  "[SDRplay diag] stream.swap result=%d, blocked=%lld us, running=%d\n",
                                  swapped ? 1 : 0, (long long)swapTime, _this->running ? 1 : 0);
