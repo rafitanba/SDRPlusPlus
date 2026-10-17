@@ -6,6 +6,7 @@ VFOManager::VFO::VFO(std::string name, int reference, double offset, double band
     this->name = name;
     _bandwidth = bandwidth;
     dspVFO = sigpath::iqFrontEnd.addVFO(name, sampleRate, bandwidth, offset);
+    dspVFO->setDiagnosticName(name);
     wtfVFO = new ImGui::WaterfallVFO;
     wtfVFO->setReference(reference);
     wtfVFO->setBandwidth(bandwidth);
