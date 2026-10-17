@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <mutex>
 
 namespace dsp::routing {
     template <class T>
@@ -65,6 +66,7 @@ namespace dsp::routing {
             base_type::tempStop();
             streams.erase(sit);
             base_type::unregisterOutput(stream);
+            clearTimeoutCount(stream);
             base_type::tempStart();
             if (!getDiagnosticName().empty()) {
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -79,13 +81,49 @@ namespace dsp::routing {
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
 
+            // The main IQ fan-out must never let a dead VFO block the FFT and every
+            // other VFO indefinitely. Its buffers represent roughly 5 ms at the
+            // current source settings, so waiting 2 ms for an already outstanding
+            // buffer is enough to distinguish a healthy consumer from a stalled one.
+            const bool isolateSlowOutputs = (getDiagnosticName() == "IQFrontEnd");
+            constexpr auto IQ_OUTPUT_WAIT = std::chrono::microseconds(2000);
+
             size_t outputIndex = 0;
             for (const auto& stream : streams) {
                 memcpy(stream->writeBuf, base_type::_in->readBuf, count * sizeof(T));
                 const auto swapStart = std::chrono::steady_clock::now();
-                const bool swapped = stream->swap(count);
+
+                bool swapped = false;
+                bool timedOut = false;
+
+                if (isolateSlowOutputs) {
+                    const auto result = stream->swapFor(count, IQ_OUTPUT_WAIT);
+                    swapped = (result == dsp::stream<T>::TimedSwapResult::SWAPPED);
+                    timedOut = (result == dsp::stream<T>::TimedSwapResult::TIMEOUT);
+                }
+                else {
+                    swapped = stream->swap(count);
+                }
+
                 const auto swapUs = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - swapStart).count();
+
+                if (timedOut) {
+                    const uint64_t drops = incrementTimeoutCount(stream);
+                    if (drops == 1 || (drops % 200) == 0) {
+                        std::fprintf(stderr,
+                                     "[DSP diag] Splitter %s output=%zu stream=%p DROP slow consumer blocked>%lld us count=%d outputs=%zu consecutiveDrops=%llu\n",
+                                     getDiagnosticName().c_str(), outputIndex, (void*)stream,
+                                     (long long)IQ_OUTPUT_WAIT.count(), count, streams.size(),
+                                     (unsigned long long)drops);
+                        std::fflush(stderr);
+                    }
+                    outputIndex++;
+                    continue;
+                }
+
+                clearTimeoutCount(stream);
+
                 if (!getDiagnosticName().empty() && (!swapped || swapUs >= 5000)) {
                     std::fprintf(stderr,
                                  "[DSP diag] Splitter %s output=%zu stream=%p swap=%d blocked=%lld us count=%d outputs=%zu\n",
@@ -116,6 +154,26 @@ namespace dsp::routing {
             auto& names = diagnosticNames();
             auto it = names.find(this);
             return (it == names.end()) ? empty : it->second;
+        }
+
+        static std::unordered_map<const stream<T>*, uint64_t>& timeoutCounts() {
+            static std::unordered_map<const stream<T>*, uint64_t> counts;
+            return counts;
+        }
+
+        static std::mutex& timeoutCountsMutex() {
+            static std::mutex mtx;
+            return mtx;
+        }
+
+        static uint64_t incrementTimeoutCount(const stream<T>* stream) {
+            std::lock_guard<std::mutex> lck(timeoutCountsMutex());
+            return ++timeoutCounts()[stream];
+        }
+
+        static void clearTimeoutCount(const stream<T>* stream) {
+            std::lock_guard<std::mutex> lck(timeoutCountsMutex());
+            timeoutCounts().erase(stream);
         }
 
         std::vector<stream<T>*> streams;
