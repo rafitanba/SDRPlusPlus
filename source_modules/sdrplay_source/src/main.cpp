@@ -676,7 +676,7 @@ private:
         flog::warn("[SDRplay diag] HARD RECOVERY: Close returned: {0}",
                    sdrplay_api_GetErrorString(err));
 
-        if (err != sdrplay_api_Success && err != sdrplay_api_NotInitialised) {
+        if (err != sdrplay_api_Success) {
             flog::error("[SDRplay diag] HARD RECOVERY aborted: Close failed");
             return false;
         }
@@ -791,26 +791,32 @@ private:
         bool initialized = false;
 
         if (!_this->initOk) {
-            // A previous hard recovery may have failed to reopen the API. Try rebuilding it
-            // directly instead of issuing calls against a known-closed session.
-            initialized = _this->hardResetApiSessionAndInit();
+            // A previous hard recovery may have closed the session and failed to reopen it.
+            // Re-open first; do not issue Close() against a session we already know is closed.
+            sdrplay_api_ErrT reopenErr = sdrplay_api_Open();
+            flog::warn("[SDRplay diag] Start: reopening closed API session returned: {0}",
+                       sdrplay_api_GetErrorString(reopenErr));
+            if (reopenErr != sdrplay_api_Success) {
+                flog::error("[SDRplay diag] Start aborted: could not reopen SDRplay API session");
+                return;
+            }
+            _this->initOk = true;
         }
-        else {
-            initialized = _this->initFreshSelectedDevice("Start attempt 1");
 
-            if (!initialized) {
-                std::fprintf(stderr, "[SDRplay diag] Init retry scheduled after 500 ms\n");
-                std::fflush(stderr);
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                initialized = _this->initFreshSelectedDevice("Start attempt 2");
-            }
+        initialized = _this->initFreshSelectedDevice("Start attempt 1");
 
-            if (!initialized) {
-                std::fprintf(stderr,
-                             "[SDRplay diag] Two normal Start attempts failed; escalating to API session reset\n");
-                std::fflush(stderr);
-                initialized = _this->hardResetApiSessionAndInit();
-            }
+        if (!initialized) {
+            std::fprintf(stderr, "[SDRplay diag] Init retry scheduled after 500 ms\n");
+            std::fflush(stderr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            initialized = _this->initFreshSelectedDevice("Start attempt 2");
+        }
+
+        if (!initialized) {
+            std::fprintf(stderr,
+                         "[SDRplay diag] Two normal Start attempts failed; escalating to API session reset\n");
+            std::fflush(stderr);
+            initialized = _this->hardResetApiSessionAndInit();
         }
 
         if (!initialized) {
