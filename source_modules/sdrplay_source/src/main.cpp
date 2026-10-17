@@ -282,8 +282,12 @@ public:
         sdrplay_api_ErrT err;
         const std::string requestedSerial = dev.SerNo;
 
-        if (!selectFreshDeviceBySerial(requestedSerial, openDev, "Device selection")) {
-            selectedName = "";
+        bool deviceMissing = false;
+        if (!selectFreshDeviceBySerial(requestedSerial, openDev, "Device selection", &deviceMissing)) {
+            if (deviceMissing) {
+                selectedName = "";
+                selectedSerial = "";
+            }
             return;
         }
         selectedSerial = openDev.SerNo;
@@ -558,7 +562,10 @@ private:
         return true;
     }
 
-    bool selectFreshDeviceBySerial(const std::string& serial, sdrplay_api_DeviceT& selectedDev, const char* context) {
+    bool selectFreshDeviceBySerial(const std::string& serial, sdrplay_api_DeviceT& selectedDev, const char* context,
+                                   bool* deviceMissing = nullptr) {
+        if (deviceMissing) { *deviceMissing = false; }
+
         sdrplay_api_DeviceT devArr[MAX_DEV_COUNT];
         unsigned int numDev = 0;
 
@@ -590,6 +597,7 @@ private:
         }
 
         if (found < 0) {
+            if (deviceMissing) { *deviceMissing = true; }
             flog::error("[SDRplay diag] {0}: serial {1} not found among {2} device(s)",
                         context, serial, numDev);
             sdrplay_api_ErrT unlockErr = sdrplay_api_UnlockDeviceApi();
