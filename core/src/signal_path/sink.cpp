@@ -34,11 +34,20 @@ void SinkManager::Stream::start() {
         return;
     }
 
-    // Start downstream first. This guarantees that the first audio buffer always has
-    // a consumer before upstream blocks begin producing data.
+    std::fprintf(stderr, "[Sink diag] Stream::start backend begin\n");
+    std::fflush(stderr);
     sink->start();
+    std::fprintf(stderr, "[Sink diag] Stream::start backend end\n");
+    std::fflush(stderr);
+
     volumeAjust.start();
+    std::fprintf(stderr, "[Sink diag] Stream::start volume end\n");
+    std::fflush(stderr);
+
     splitter.start();
+    std::fprintf(stderr, "[Sink diag] Stream::start splitter end\n");
+    std::fflush(stderr);
+
     running = true;
 }
 
@@ -47,12 +56,29 @@ void SinkManager::Stream::stop() {
         return;
     }
 
-    // Stop in the opposite order: first prevent new upstream data, then drain/stop
-    // the volume stage, and finally stop the concrete audio backend.
-    splitter.stop();
-    volumeAjust.stop();
-    sink->stop();
+    // Stop the real-time consumer first. Once the backend callback is no longer
+    // reading, stop each upstream producer in order. The previous upstream-first
+    // order could join the splitter while the volume stage was itself blocked on
+    // an audio backend that had stopped consuming.
     running = false;
+
+    std::fprintf(stderr, "[Sink diag] Stream::stop backend begin\n");
+    std::fflush(stderr);
+    sink->stop();
+    std::fprintf(stderr, "[Sink diag] Stream::stop backend end\n");
+    std::fflush(stderr);
+
+    std::fprintf(stderr, "[Sink diag] Stream::stop volume begin\n");
+    std::fflush(stderr);
+    volumeAjust.stop();
+    std::fprintf(stderr, "[Sink diag] Stream::stop volume end\n");
+    std::fflush(stderr);
+
+    std::fprintf(stderr, "[Sink diag] Stream::stop splitter begin\n");
+    std::fflush(stderr);
+    splitter.stop();
+    std::fprintf(stderr, "[Sink diag] Stream::stop splitter end\n");
+    std::fflush(stderr);
 }
 
 void SinkManager::Stream::setVolume(float volume) {
@@ -97,14 +123,10 @@ void SinkManager::registerSinkProvider(std::string name, SinkProvider provider) 
         return;
     }
 
-    // Add to the list
     providers[name] = provider;
     providerNames.push_back(name);
-
-    // Recreatd the text list for the menu
     refreshProviders();
 
-    // Update the IDs of every stream
     for (auto& [streamName, stream] : streams) {
         stream->providerId = std::distance(providerNames.begin(), std::find(providerNames.begin(), providerNames.end(), stream->providerName));
     }
@@ -120,20 +142,15 @@ void SinkManager::unregisterSinkProvider(std::string name) {
 
     onSinkProviderUnregister.emit(name);
 
-    // Switch all sinks using it to a null sink
     for (auto& [streamName, stream] : streams) {
         if (providerNames[stream->providerId] != name) { continue; }
         setStreamSink(streamName, "None");
     }
 
-    // Erase the provider from the lists
     providers.erase(name);
     providerNames.erase(std::find(providerNames.begin(), providerNames.end(), name));
-
-    // Recreatd the text list for the menu
     refreshProviders();
 
-    // Update the IDs of every stream
     for (auto& [streamName, stream] : streams) {
         stream->providerId = std::distance(providerNames.begin(), std::find(providerNames.begin(), providerNames.end(), stream->providerName));
     }
@@ -148,7 +165,6 @@ void SinkManager::registerStream(std::string name, SinkManager::Stream* stream) 
     }
 
     SinkManager::SinkProvider provider;
-
     provider = providers["None"];
 
     stream->sink = provider.create(stream, name, provider.ctx);
@@ -158,7 +174,6 @@ void SinkManager::registerStream(std::string name, SinkManager::Stream* stream) 
     streams[name] = stream;
     streamNames.push_back(name);
 
-    // Load config
     core::configManager.acquire();
     bool available = core::configManager.conf["streams"].contains(name);
     core::configManager.release();
@@ -239,10 +254,6 @@ void SinkManager::setStreamSink(std::string name, std::string providerName) {
                  wasRunning ? 1 : 0);
     std::fflush(stderr);
 
-    // Do not stop/delete only the backend while upstream audio blocks are still
-    // producing into it. That can leave the UI thread waiting in a backend stop.
-    // Quiesce the complete stream first, replace the backend, then restart from
-    // downstream to upstream.
     if (wasRunning) {
         stream->stop();
         std::fprintf(stderr, "[Sink diag] stream fully stopped before backend replacement\n");
@@ -250,7 +261,7 @@ void SinkManager::setStreamSink(std::string name, std::string providerName) {
     }
 
     delete stream->sink;
-    stream->providerId = std::distance(providerNames.begin(), std::find(providerNames.begin(), providerNames.end(), providerName));
+    stream->providerId = std::distance(providerNames.begin(), std::find(providerNames.begin(), providerName));
     stream->providerName = providerName;
     SinkManager::SinkProvider prov = providers[providerName];
     stream->sink = prov.create(stream, name, prov.ctx);
@@ -270,7 +281,6 @@ void SinkManager::setStreamSink(std::string name, std::string providerName) {
 }
 
 void SinkManager::showVolumeSlider(std::string name, std::string prefix, float width, float btnHeight, int btnBorder, bool sameLine) {
-    // TODO: Replace map with some hashmap for it to be faster
     float height = ImGui::GetTextLineHeightWithSpacing() + 2;
     float sliderHeight = height;
     if (btnHeight > 0) {
@@ -329,7 +339,6 @@ void SinkManager::showVolumeSlider(std::string name, std::string prefix, float w
         core::configManager.release(true);
     }
     if (sameLine) { ImGui::SetCursorPosY(ypos); }
-    //ImGui::SetCursorPosY(ypos);
 }
 
 void SinkManager::loadStreamConfig(std::string name) {
@@ -365,7 +374,6 @@ void SinkManager::saveStreamConfig(std::string name) {
     core::configManager.conf["streams"][name] = conf;
 }
 
-// Note: acquire and release config before running this
 void SinkManager::loadSinksFromConfig() {
     for (auto const& [name, stream] : streams) {
         if (!core::configManager.conf["streams"].contains(name)) { continue; }
