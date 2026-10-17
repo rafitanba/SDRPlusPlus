@@ -101,7 +101,7 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] lifecycle-v3: fresh enumeration + Init retry + overload ACK/sample-gap diagnostics\n");
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v3: Init retry + overload ACK + sample gaps + serialized gain updates\n");
         std::fflush(stderr);
 
         sampleRate = 2000000.0;
@@ -867,6 +867,36 @@ private:
         flog::info("SDRPlaySourceModule '{0}': Tune: {1}!", _this->name, freq);
     }
 
+    bool updateGainAndWait(const char* context) {
+        const uint64_t before = gainChangeSequence.load();
+        const sdrplay_api_ErrT err = sdrplay_api_Update(
+            openDev.dev,
+            openDev.tuner,
+            sdrplay_api_Update_Tuner_Gr,
+            sdrplay_api_Update_Ext1_None);
+
+        if (err != sdrplay_api_Success) {
+            std::fprintf(stderr,
+                         "[SDRplay diag] %s: Update_Tuner_Gr failed: %s\n",
+                         context, sdrplay_api_GetErrorString(err));
+            std::fflush(stderr);
+            return false;
+        }
+
+        for (int i = 0; i < 100; i++) {
+            if (gainChangeSequence.load() != before) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        std::fprintf(stderr,
+                     "[SDRplay diag] %s: GainChange timeout after Update_Tuner_Gr\n",
+                     context);
+        std::fflush(stderr);
+        return false;
+    }
+
     static void menuHandler(void* ctx) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
 
@@ -972,7 +1002,7 @@ private:
             if (SmGui::SliderInt(CONCAT("##sdrplay_lna_gain", _this->name), &_this->lnaGain, _this->lnaSteps - 1, 0, SmGui::FMT_STR_NONE)) {
                 if (_this->running) {
                     _this->channelParams->tunerParams.gain.LNAstate = _this->lnaGain;
-                    sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Gr, sdrplay_api_Update_Ext1_None);
+                    _this->updateGainAndWait("LNA Gain");
                 }
                 config.acquire();
                 config.conf["devices"][_this->selectedName]["lnaGain"] = _this->lnaGain;
@@ -985,7 +1015,7 @@ private:
             if (SmGui::SliderInt(CONCAT("##sdrplay_gain", _this->name), &_this->gain, 59, 20, SmGui::FMT_STR_NONE)) {
                 if (_this->running) {
                     _this->channelParams->tunerParams.gain.gRdB = _this->gain;
-                    sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Gr, sdrplay_api_Update_Ext1_None);
+                    _this->updateGainAndWait("IF Gain");
                 }
                 config.acquire();
                 config.conf["devices"][_this->selectedName]["ifGain"] = _this->gain;
@@ -1404,7 +1434,12 @@ private:
             return;
         }
 
-        // GainChange (0) can be very frequent with AGC, so avoid logging it.
+        if (eventId == sdrplay_api_GainChange) {
+            _this->gainChangeSequence.fetch_add(1);
+            return;
+        }
+
+        // Other non-gain events are uncommon enough to log directly.
         if ((int)eventId != 0) {
             std::fprintf(stderr, "[SDRplay diag] API event id=%d, tuner=%d, running=%d\n",
                          (int)eventId, (int)tuner, _this->running ? 1 : 0);
@@ -1425,6 +1460,7 @@ private:
     std::atomic<uint64_t> lastStreamCallbackMs{0};
     std::atomic<bool> inStreamSwap{false};
     std::atomic<uint64_t> streamSwapStartMs{0};
+    std::atomic<uint64_t> gainChangeSequence{0};
     std::thread watchdogThread;
 
     unsigned int expectedSampleNum = 0;
