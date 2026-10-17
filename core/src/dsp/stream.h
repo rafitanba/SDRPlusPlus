@@ -2,6 +2,7 @@
 #include <string.h>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 #include <volk/volk.h>
 #include "buffer/buffer.h"
 
@@ -24,6 +25,12 @@ namespace dsp {
     template <class T>
     class stream : public untyped_stream {
     public:
+        enum class TimedSwapResult {
+            SWAPPED,
+            STOPPED,
+            TIMEOUT,
+        };
+
         stream() {
             writeBuf = buffer::alloc<T>(STREAM_BUFFER_SIZE);
             readBuf = buffer::alloc<T>(STREAM_BUFFER_SIZE);
@@ -65,6 +72,37 @@ namespace dsp {
             rdyCV.notify_all();
 
             return true;
+        }
+
+        // Timed variant used by fan-out paths where one stalled consumer must not
+        // freeze every other consumer. On timeout no buffers are exchanged: the
+        // unread read buffer is preserved and the caller may overwrite writeBuf
+        // with a newer frame on the next iteration.
+        inline TimedSwapResult swapFor(int size, std::chrono::microseconds timeout) {
+            {
+                std::unique_lock<std::mutex> lck(swapMtx);
+                const bool ready = swapCV.wait_for(
+                    lck,
+                    timeout,
+                    [this] { return (canSwap || writerStop); });
+
+                if (!ready) { return TimedSwapResult::TIMEOUT; }
+                if (writerStop) { return TimedSwapResult::STOPPED; }
+
+                dataSize = size;
+                T* temp = writeBuf;
+                writeBuf = readBuf;
+                readBuf = temp;
+                canSwap = false;
+            }
+
+            {
+                std::lock_guard<std::mutex> lck(rdyMtx);
+                dataReady = true;
+            }
+            rdyCV.notify_all();
+
+            return TimedSwapResult::SWAPPED;
         }
 
         virtual inline int read() {
