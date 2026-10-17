@@ -7,6 +7,7 @@
 #include <string>
 #include <utils/event.h>
 #include <mutex>
+#include <chrono>
 #include <gui/tuner.h>
 
 #define WINDOW_FLAGS ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBackground
@@ -61,6 +62,14 @@ private:
     dsp::stream<dsp::complex_t> dummyStream;
     bool demoWindow = false;
     int selectedWindow = 0;
+
+    // Frequency-scale drags can generate hundreds of tune requests per second.
+    // Keep updating the UI while dragging, but defer the hardware retune until
+    // the mouse is released or movement has been idle for 500 ms.
+    static constexpr int CENTER_TUNE_DEBOUNCE_MS = 500;
+    bool deferredCenterTunePending = false;
+    double deferredCenterTuneFrequency = 0.0;
+    std::chrono::steady_clock::time_point deferredCenterTuneLastChange{};
 
     bool initComplete = false;
     bool autostart = false;
