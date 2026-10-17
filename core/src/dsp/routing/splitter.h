@@ -109,10 +109,13 @@ namespace dsp::routing {
                     std::chrono::steady_clock::now() - swapStart).count();
 
                 if (timedOut) {
+                    // Count total dropped frames for this output rather than resetting on
+                    // every one-frame recovery. Otherwise an alternating slow consumer
+                    // floods stderr with a "drop=1" line hundreds of times per second.
                     const uint64_t drops = incrementTimeoutCount(stream);
-                    if (drops == 1 || (drops % 200) == 0) {
+                    if (drops == 1 || (drops % 1000) == 0) {
                         std::fprintf(stderr,
-                                     "[DSP diag] Splitter %s output=%zu stream=%p DROP slow consumer blocked>%lld us count=%d outputs=%zu consecutiveDrops=%llu\n",
+                                     "[DSP diag] Splitter %s output=%zu stream=%p DROP slow consumer blocked>%lld us count=%d outputs=%zu totalDrops=%llu\n",
                                      getDiagnosticName().c_str(), outputIndex, (void*)stream,
                                      (long long)IQ_OUTPUT_WAIT.count(), count, streams.size(),
                                      (unsigned long long)drops);
@@ -121,8 +124,6 @@ namespace dsp::routing {
                     outputIndex++;
                     continue;
                 }
-
-                clearTimeoutCount(stream);
 
                 if (!getDiagnosticName().empty() && (!swapped || swapUs >= 5000)) {
                     std::fprintf(stderr,
