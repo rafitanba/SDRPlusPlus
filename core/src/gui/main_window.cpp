@@ -266,6 +266,27 @@ void MainWindow::draw() {
         vfo = gui::waterfall.vfos[gui::waterfall.selectedVFO];
     }
 
+    auto updateDisplayedFrequency = [&]() {
+        if (vfo != NULL) {
+            gui::freqSelect.setFrequency(gui::waterfall.getCenterFrequency() + vfo->generalOffset);
+        }
+        else {
+            gui::freqSelect.setFrequency(gui::waterfall.getCenterFrequency());
+        }
+        gui::freqSelect.frequencyChanged = false;
+    };
+
+    auto applyCenterFrequencyTune = [&](double frequency, bool deferred) {
+        sigpath::sourceManager.tune(frequency);
+        updateDisplayedFrequency();
+        core::configManager.acquire();
+        core::configManager.conf["frequency"] = frequency;
+        core::configManager.release(true);
+        if (deferred) {
+            flog::info("[Tuner diag] Applied deferred center-frequency tune: {0} Hz", frequency);
+        }
+    };
+
     // Handle VFO movement
     if (vfo != NULL) {
         if (vfo->centerOffsetChanged) {
@@ -292,6 +313,7 @@ void MainWindow::draw() {
     // Handle change in selected frequency
     if (gui::freqSelect.frequencyChanged) {
         gui::freqSelect.frequencyChanged = false;
+        deferredCenterTunePending = false;
         tuner::tune(tuningMode, gui::waterfall.selectedVFO, gui::freqSelect.frequency);
         if (vfo != NULL) {
             vfo->centerOffsetChanged = false;
@@ -306,19 +328,37 @@ void MainWindow::draw() {
         core::configManager.release(true);
     }
 
-    // Handle dragging the frequency scale
+    // A frequency-scale drag used to retune the hardware once per rendered frame.
+    // Keep the UI responsive, but apply only the final frequency after release or
+    // after 500 ms without movement while the mouse remains held.
+    const auto centerTuneNow = std::chrono::steady_clock::now();
+    const bool frequencyScaleDragging =
+        gui::waterfall.mouseInFreq && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+
     if (gui::waterfall.centerFreqMoved) {
         gui::waterfall.centerFreqMoved = false;
-        sigpath::sourceManager.tune(gui::waterfall.getCenterFrequency());
-        if (vfo != NULL) {
-            gui::freqSelect.setFrequency(gui::waterfall.getCenterFrequency() + vfo->generalOffset);
+        updateDisplayedFrequency();
+
+        const double requestedFrequency = gui::waterfall.getCenterFrequency();
+        if (frequencyScaleDragging) {
+            deferredCenterTunePending = true;
+            deferredCenterTuneFrequency = requestedFrequency;
+            deferredCenterTuneLastChange = centerTuneNow;
         }
         else {
-            gui::freqSelect.setFrequency(gui::waterfall.getCenterFrequency());
+            deferredCenterTunePending = false;
+            applyCenterFrequencyTune(requestedFrequency, false);
         }
-        core::configManager.acquire();
-        core::configManager.conf["frequency"] = gui::waterfall.getCenterFrequency();
-        core::configManager.release(true);
+    }
+
+    if (deferredCenterTunePending) {
+        const auto idleFor = std::chrono::duration_cast<std::chrono::milliseconds>(
+            centerTuneNow - deferredCenterTuneLastChange).count();
+        if (!frequencyScaleDragging || idleFor >= CENTER_TUNE_DEBOUNCE_MS) {
+            const double finalFrequency = deferredCenterTuneFrequency;
+            deferredCenterTunePending = false;
+            applyCenterFrequencyTune(finalFrequency, true);
+        }
     }
 
     int _fftHeight = gui::waterfall.getFFTHeight();
@@ -598,6 +638,7 @@ void MainWindow::draw() {
             else {
                 nfreq = gui::waterfall.getCenterFrequency() - (gui::waterfall.getViewBandwidth() * wheel / 20.0);
             }
+            deferredCenterTunePending = false;
             tuner::tune(tuningMode, gui::waterfall.selectedVFO, nfreq);
             gui::freqSelect.setFrequency(nfreq);
             core::configManager.acquire();
@@ -683,6 +724,7 @@ void MainWindow::setPlayState(bool _playing) {
         onPlayStateChange.emit(true);
     }
     else {
+        deferredCenterTunePending = false;
         playing = false;
         onPlayStateChange.emit(false);
         sigpath::sourceManager.stop();
