@@ -12,6 +12,7 @@
 #include <atomic>
 #include <thread>
 #include <cstdio>
+#include <cstring>
 #include <utils/optionlist.h>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -197,12 +198,9 @@ public:
 
         sdrplay_api_DeviceT devArr[MAX_DEV_COUNT];
         unsigned int numDev = 0;
-        sdrplay_api_ErrT err = sdrplay_api_GetDevices(devArr, &numDev, MAX_DEV_COUNT);
-        if (err != sdrplay_api_Success) {
-            flog::error("[SDRplay diag] GetDevices failed: {0}", sdrplay_api_GetErrorString(err));
+        if (!getDevicesWithApiLock(devArr, numDev, "Refresh")) {
             return;
         }
-        flog::info("[SDRplay diag] GetDevices returned {0} device(s)", numDev);
 
         for (unsigned int i = 0; i < numDev; i++) {
             devList.push_back(devArr[i]);
@@ -278,23 +276,14 @@ public:
     }
 
     void selectDev(sdrplay_api_DeviceT dev, int id) {
-        openDev = dev;
         sdrplay_api_ErrT err;
+        const std::string requestedSerial = dev.SerNo;
 
-        openDev.tuner = sdrplay_api_Tuner_A;
-        openDev.rspDuoMode = sdrplay_api_RspDuoMode_Single_Tuner;
-        err = sdrplay_api_SelectDevice(&openDev);
-        if (err != sdrplay_api_Success) {
-            const char* errStr = sdrplay_api_GetErrorString(err);
-            flog::error("Could not select RSP device: {0}", errStr);
+        if (!selectFreshDeviceBySerial(requestedSerial, openDev, "Device selection")) {
             selectedName = "";
             return;
         }
-
-        err = sdrplay_api_UnlockDeviceApi();
-        if (err != sdrplay_api_Success) {
-            flog::warn("[SDRplay diag] UnlockDeviceApi after SelectDevice returned: {0}", sdrplay_api_GetErrorString(err));
-        }
+        selectedSerial = openDev.SerNo;
 
         err = sdrplay_api_DebugEnable(openDev.dev, sdrplay_api_DbgLvl_Message);
         if (err != sdrplay_api_Success) {
@@ -534,6 +523,101 @@ public:
     }
 
 private:
+    bool getDevicesWithApiLock(sdrplay_api_DeviceT* devArr, unsigned int& numDev, const char* context) {
+        sdrplay_api_ErrT err = sdrplay_api_LockDeviceApi();
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] {0}: LockDeviceApi failed: {1}",
+                        context, sdrplay_api_GetErrorString(err));
+            return false;
+        }
+
+        err = sdrplay_api_GetDevices(devArr, &numDev, MAX_DEV_COUNT);
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] {0}: GetDevices failed: {1}",
+                        context, sdrplay_api_GetErrorString(err));
+            sdrplay_api_ErrT unlockErr = sdrplay_api_UnlockDeviceApi();
+            if (unlockErr != sdrplay_api_Success) {
+                flog::warn("[SDRplay diag] {0}: UnlockDeviceApi after GetDevices failure returned: {1}",
+                           context, sdrplay_api_GetErrorString(unlockErr));
+            }
+            return false;
+        }
+
+        sdrplay_api_ErrT unlockErr = sdrplay_api_UnlockDeviceApi();
+        if (unlockErr != sdrplay_api_Success) {
+            flog::warn("[SDRplay diag] {0}: UnlockDeviceApi returned: {1}",
+                       context, sdrplay_api_GetErrorString(unlockErr));
+        }
+
+        flog::info("[SDRplay diag] {0}: GetDevices returned {1} device(s)", context, numDev);
+        return true;
+    }
+
+    bool selectFreshDeviceBySerial(const std::string& serial, sdrplay_api_DeviceT& selectedDev, const char* context) {
+        sdrplay_api_DeviceT devArr[MAX_DEV_COUNT];
+        unsigned int numDev = 0;
+
+        sdrplay_api_ErrT err = sdrplay_api_LockDeviceApi();
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] {0}: LockDeviceApi failed: {1}",
+                        context, sdrplay_api_GetErrorString(err));
+            return false;
+        }
+
+        err = sdrplay_api_GetDevices(devArr, &numDev, MAX_DEV_COUNT);
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] {0}: GetDevices failed while selecting serial {1}: {2}",
+                        context, serial, sdrplay_api_GetErrorString(err));
+            sdrplay_api_ErrT unlockErr = sdrplay_api_UnlockDeviceApi();
+            if (unlockErr != sdrplay_api_Success) {
+                flog::warn("[SDRplay diag] {0}: UnlockDeviceApi after GetDevices failure returned: {1}",
+                           context, sdrplay_api_GetErrorString(unlockErr));
+            }
+            return false;
+        }
+
+        int found = -1;
+        for (unsigned int i = 0; i < numDev; i++) {
+            if (std::strcmp(devArr[i].SerNo, serial.c_str()) == 0) {
+                found = (int)i;
+                break;
+            }
+        }
+
+        if (found < 0) {
+            flog::error("[SDRplay diag] {0}: serial {1} not found among {2} device(s)",
+                        context, serial, numDev);
+            sdrplay_api_ErrT unlockErr = sdrplay_api_UnlockDeviceApi();
+            if (unlockErr != sdrplay_api_Success) {
+                flog::warn("[SDRplay diag] {0}: UnlockDeviceApi after missing device returned: {1}",
+                           context, sdrplay_api_GetErrorString(unlockErr));
+            }
+            return false;
+        }
+
+        sdrplay_api_DeviceT freshDev = devArr[found];
+        freshDev.tuner = sdrplay_api_Tuner_A;
+        freshDev.rspDuoMode = sdrplay_api_RspDuoMode_Single_Tuner;
+
+        err = sdrplay_api_SelectDevice(&freshDev);
+        sdrplay_api_ErrT unlockErr = sdrplay_api_UnlockDeviceApi();
+        if (unlockErr != sdrplay_api_Success) {
+            flog::warn("[SDRplay diag] {0}: UnlockDeviceApi after SelectDevice returned: {1}",
+                       context, sdrplay_api_GetErrorString(unlockErr));
+        }
+
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] {0}: SelectDevice for serial {1} failed: {2}",
+                        context, serial, sdrplay_api_GetErrorString(err));
+            return false;
+        }
+
+        selectedDev = freshDev;
+        flog::info("[SDRplay diag] {0}: selected fresh device serial {1} from {2} enumerated device(s)",
+                   context, serial, numDev);
+        return true;
+    }
+
     static uint64_t monotonicMs() {
         return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -568,22 +652,18 @@ private:
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
         if (_this->running) { return; }
 
-        // First, acquire device
+        // Re-enumerate and acquire a fresh device descriptor for every Start.
+        // This follows the SDRplay API sequence Lock -> GetDevices -> SelectDevice -> Unlock
+        // instead of reusing a descriptor cached during the menu-selection phase.
         sdrplay_api_ErrT err;
-
-        _this->openDev.tuner = sdrplay_api_Tuner_A;
-        _this->openDev.rspDuoMode = sdrplay_api_RspDuoMode_Single_Tuner;
-        err = sdrplay_api_SelectDevice(&_this->openDev);
-        if (err != sdrplay_api_Success) {
-            const char* errStr = sdrplay_api_GetErrorString(err);
-            flog::error("Could not select RSP device: {0}", errStr);
-            _this->selectedName = "";
+        if (_this->selectedSerial.empty()) {
+            flog::error("[SDRplay diag] Cannot Start: no selected SDRplay serial");
             return;
         }
 
-        err = sdrplay_api_UnlockDeviceApi();
-        if (err != sdrplay_api_Success) {
-            flog::warn("[SDRplay diag] UnlockDeviceApi at Start returned: {0}", sdrplay_api_GetErrorString(err));
+        if (!_this->selectFreshDeviceBySerial(_this->selectedSerial, _this->openDev, "Start")) {
+            flog::error("Could not select RSP device with serial {0}", _this->selectedSerial);
+            return;
         }
 
         err = sdrplay_api_DebugEnable(_this->openDev.dev, sdrplay_api_DbgLvl_Message);
@@ -1324,6 +1404,7 @@ private:
     std::string devListTxt;
     std::vector<std::string> devNameList;
     std::string selectedName;
+    std::string selectedSerial;
 
     OptionList<int, int> samplerates;
     OptionList<int, sdrplay_api_Bw_MHzT> bandwidths;
