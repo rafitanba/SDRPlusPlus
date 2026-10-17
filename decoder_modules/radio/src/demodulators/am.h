@@ -32,6 +32,7 @@ namespace demod {
 
             // Define structure
             demod.init(input, carrierAgc ? dsp::demod::AM<dsp::stereo_t>::AGCMode::CARRIER : dsp::demod::AM<dsp::stereo_t>::AGCMode::AUDIO, bandwidth, agcAttack / getIFSampleRate(), agcDecay / getIFSampleRate(), 100.0 / getIFSampleRate(), getIFSampleRate());
+            demod.setDiagnosticName(name);
         }
 
         void start() { demod.start(); }
