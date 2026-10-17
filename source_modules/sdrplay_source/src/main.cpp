@@ -678,7 +678,7 @@ private:
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&_this->openDev);
             flog::warn("[SDRplay diag] ReleaseDevice after Start/GetDeviceParams failure: {0}",
                        sdrplay_api_GetErrorString(releaseErr));
-            _this->selectedName = "";
+            // Keep the selected device identity so Start can be retried after a transient API failure.
             return;
         }
 
@@ -689,7 +689,7 @@ private:
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&_this->openDev);
             flog::warn("[SDRplay diag] ReleaseDevice after Start/Init failure: {0}",
                        sdrplay_api_GetErrorString(releaseErr));
-            _this->selectedName = "";
+            // Keep the selected device identity so Start can be retried after a transient API failure.
             return;
         }
         _this->lastStreamCallbackMs.store(monotonicMs());
