@@ -101,7 +101,7 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] lifecycle-v4: Init retry + API Close/Open recovery + overload ACK + sample gaps\n");
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v5: pre-Init RSP1B config + API recovery + overload ACK + sample gaps\n");
         std::fflush(stderr);
 
         sampleRate = 2000000.0;
@@ -307,6 +307,13 @@ public:
             // Keep the UI/device identity on transient parameter failures.
             // A later fresh enumeration will decide whether the device is really gone.
             return;
+        }
+
+        if (!configureSelectedDeviceBeforeInit(context)) {
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] {0}: ReleaseDevice after pre-Init configuration failure: {1}",
+                       context, sdrplay_api_GetErrorString(releaseErr));
+            return false;
         }
 
         err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
@@ -631,6 +638,67 @@ private:
         return true;
     }
 
+    bool configureSelectedDeviceBeforeInit(const char* context) {
+        if (!openDevParams || !openDevParams->devParams) {
+            flog::error("[SDRplay diag] {0}: device params unavailable before Init", context);
+            return false;
+        }
+
+        channelParams = openDevParams->rxChannelA;
+        if (!channelParams) {
+            flog::error("[SDRplay diag] {0}: RX channel A params unavailable before Init", context);
+            return false;
+        }
+
+        // RSP1A / RSP1B device-specific settings can be supplied in the parameter
+        // structure before Init. Avoid a burst of runtime Update() calls during startup.
+        if (openDev.hwVer == SDRPLAY_RSP1A_ID || openDev.hwVer == SDRPLAY_RSP1B_ID) {
+            openDevParams->devParams->rsp1aParams.rfNotchEnable = rsp1a_fmmwNotch;
+            openDevParams->devParams->rsp1aParams.rfDabNotchEnable = rsp1a_dabNotch;
+            channelParams->rsp1aTunerParams.biasTEnable = rsp1a_biasT;
+        }
+
+        // General tuner/control settings.
+        if (ifModeId == 0) {
+            bandwidth = (bandwidthId == 8) ? preferedBandwidth[srId] : bandwidths[bandwidthId];
+            openDevParams->devParams->fsFreq.fsHz = sampleRate;
+            channelParams->tunerParams.bwType = bandwidth;
+        }
+        else {
+            openDevParams->devParams->fsFreq.fsHz = ifModes[ifModeId].deviceSamplerate;
+            channelParams->tunerParams.bwType = ifModes[ifModeId].bw;
+        }
+
+        channelParams->tunerParams.rfFreq.rfHz = freq;
+        channelParams->tunerParams.gain.gRdB = gain;
+        channelParams->tunerParams.gain.LNAstate = lnaGain;
+        channelParams->ctrlParams.decimation.enable = false;
+        channelParams->ctrlParams.dcOffset.DCenable = true;
+        channelParams->ctrlParams.dcOffset.IQenable = true;
+        channelParams->tunerParams.ifType = ifModes[ifModeId].ifValue;
+        channelParams->tunerParams.loMode = sdrplay_api_LO_Auto;
+
+        channelParams->ctrlParams.agc.attack_ms = agcAttack;
+        channelParams->ctrlParams.agc.decay_ms = agcDecay;
+        channelParams->ctrlParams.agc.decay_delay_ms = agcDecayDelay;
+        channelParams->ctrlParams.agc.decay_threshold_dB = agcDecayThreshold;
+        channelParams->ctrlParams.agc.setPoint_dBfs = agcSetPoint;
+        channelParams->ctrlParams.agc.enable = agc ? sdrplay_api_AGC_CTRL_EN : sdrplay_api_AGC_DISABLE;
+
+        std::fprintf(stderr,
+                     "[SDRplay diag] PRE-INIT CONFIG: hw=%u fs=%.0f rf=%.0f bw=%d if=%d gRdB=%d lna=%d agc=%d\n",
+                     (unsigned int)openDev.hwVer,
+                     openDevParams->devParams->fsFreq.fsHz,
+                     channelParams->tunerParams.rfFreq.rfHz,
+                     (int)channelParams->tunerParams.bwType,
+                     (int)channelParams->tunerParams.ifType,
+                     channelParams->tunerParams.gain.gRdB,
+                     channelParams->tunerParams.gain.LNAstate,
+                     agc ? 1 : 0);
+        std::fflush(stderr);
+        return true;
+    }
+
     bool initFreshSelectedDevice(const char* context) {
         if (!selectFreshDeviceBySerial(selectedSerial, openDev, context)) {
             return false;
@@ -730,6 +798,13 @@ private:
                         sdrplay_api_GetErrorString(err));
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
             flog::warn("[SDRplay diag] HARD RECOVERY: ReleaseDevice after GetDeviceParams failure: {0}",
+                       sdrplay_api_GetErrorString(releaseErr));
+            return false;
+        }
+
+        if (!configureSelectedDeviceBeforeInit("HARD RECOVERY")) {
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] HARD RECOVERY: ReleaseDevice after pre-Init configuration failure: {0}",
                        sdrplay_api_GetErrorString(releaseErr));
             return false;
         }
@@ -838,12 +913,7 @@ private:
 
         // RSP1A Options
         if (_this->openDev.hwVer == SDRPLAY_RSP1A_ID || _this->openDev.hwVer == SDRPLAY_RSP1B_ID) {
-            _this->openDevParams->devParams->rsp1aParams.rfNotchEnable = _this->rsp1a_fmmwNotch;
-            _this->openDevParams->devParams->rsp1aParams.rfDabNotchEnable = _this->rsp1a_dabNotch;
-            _this->channelParams->rsp1aTunerParams.biasTEnable = _this->rsp1a_biasT;
-            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Rsp1a_RfNotchControl, sdrplay_api_Update_Ext1_None);
-            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Rsp1a_RfDabNotchControl, sdrplay_api_Update_Ext1_None);
-            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Rsp1a_BiasTControl, sdrplay_api_Update_Ext1_None);
+            // Already applied before Init. Do not send startup Update() calls for RSP1A/RSP1B.
         }
         else if (_this->openDev.hwVer == SDRPLAY_RSP2_ID) {
             _this->channelParams->rsp2TunerParams.rfNotchEnable = _this->rsp2_fmmwNotch;
@@ -905,15 +975,17 @@ private:
         _this->channelParams->ctrlParams.agc.setPoint_dBfs = _this->agcSetPoint;
         _this->channelParams->ctrlParams.agc.enable = _this->agc ? sdrplay_api_AGC_CTRL_EN : sdrplay_api_AGC_DISABLE;
 
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Dev_Fs, sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_BwType, sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_IfType, sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_LoMode, sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Ctrl_Decimation, sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Ctrl_DCoffsetIQimbalance, sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Gr, sdrplay_api_Update_Ext1_None);
-        sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
+        if (_this->openDev.hwVer != SDRPLAY_RSP1A_ID && _this->openDev.hwVer != SDRPLAY_RSP1B_ID) {
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Dev_Fs, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_BwType, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_IfType, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_LoMode, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Ctrl_Decimation, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Ctrl_DCoffsetIQimbalance, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Gr, sdrplay_api_Update_Ext1_None);
+            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
+        }
 
         _this->running = true;
         flog::info("SDRPlaySourceModule '{0}': Start!", _this->name);
