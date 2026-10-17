@@ -101,7 +101,7 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] lifecycle-v7: stream-health validation + API recovery + metadata-only selection\n");
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v8: forwarded-data health validation + API recovery\n");
         std::fflush(stderr);
 
         sampleRate = 2000000.0;
@@ -682,34 +682,69 @@ private:
         return true;
     }
 
-    bool waitForHealthyCallbackFlow(const char* context, uint64_t callbacksBeforeInit) {
-        // A healthy 6 MS/s RSP1B produces callbacks very rapidly. We only require a tiny
-        // number so this remains conservative at lower sample rates.
-        constexpr uint64_t MIN_CALLBACKS = 8;
-        constexpr int MAX_WAIT_MS = 750;
+    bool waitForHealthyDataFlow(const char* context,
+                                  uint64_t forwardedBeforeInit,
+                                  uint64_t swapsBeforeInit) {
+        // Raw API callbacks are not enough: callbacks received while the source is not
+        // accepting samples are deliberately discarded. Require actual callbacks to be
+        // forwarded into SDR++ and at least one successful stream.swap(), then verify that
+        // the flow remains active for a second observation window.
+        constexpr uint64_t MIN_FORWARDED_CALLBACKS = 8;
+        constexpr uint64_t MIN_SWAPS = 1;
+        constexpr int INITIAL_WAIT_MS = 750;
+        constexpr int SUSTAIN_MS = 300;
 
-        for (int waited = 0; waited < MAX_WAIT_MS; waited += 10) {
-            const uint64_t nowCount = streamCallbackCount.load();
-            if (nowCount >= callbacksBeforeInit + MIN_CALLBACKS) {
-                std::fprintf(stderr,
-                             "[SDRplay diag] %s: stream health OK (%llu callbacks after Init in <=%d ms)\n",
-                             context,
-                             (unsigned long long)(nowCount - callbacksBeforeInit),
-                             waited + 10);
-                std::fflush(stderr);
-                return true;
+        bool initialFlow = false;
+        for (int waited = 0; waited < INITIAL_WAIT_MS; waited += 10) {
+            const uint64_t forwarded = forwardedCallbackCount.load();
+            const uint64_t swaps = successfulSwapCount.load();
+            if (forwarded >= forwardedBeforeInit + MIN_FORWARDED_CALLBACKS &&
+                swaps >= swapsBeforeInit + MIN_SWAPS) {
+                initialFlow = true;
+                break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
-        const uint64_t finalCount = streamCallbackCount.load();
+        if (!initialFlow) {
+            std::fprintf(stderr,
+                         "[SDRplay diag] %s: DATA HEALTH FAIL during initial window "
+                         "(raw=%llu forwarded=%llu swaps=%llu in %d ms)\n",
+                         context,
+                         (unsigned long long)streamCallbackCount.load(),
+                         (unsigned long long)(forwardedCallbackCount.load() - forwardedBeforeInit),
+                         (unsigned long long)(successfulSwapCount.load() - swapsBeforeInit),
+                         INITIAL_WAIT_MS);
+            std::fflush(stderr);
+            return false;
+        }
+
+        const uint64_t forwardedAtSustainStart = forwardedCallbackCount.load();
+        const uint64_t swapsAtSustainStart = successfulSwapCount.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(SUSTAIN_MS));
+
+        const uint64_t forwardedNow = forwardedCallbackCount.load();
+        const uint64_t swapsNow = successfulSwapCount.load();
+        const uint64_t now = monotonicMs();
+        const uint64_t lastCb = lastStreamCallbackMs.load();
+        const uint64_t callbackAge = lastCb ? (now - lastCb) : 999999;
+
+        const bool sustained =
+            forwardedNow >= forwardedAtSustainStart + MIN_FORWARDED_CALLBACKS &&
+            swapsNow >= swapsAtSustainStart + MIN_SWAPS &&
+            callbackAge <= 100;
+
         std::fprintf(stderr,
-                     "[SDRplay diag] %s: STREAM HEALTH FAIL (%llu callbacks in %d ms after successful Init)\n",
+                     "[SDRplay diag] %s: %s "
+                     "(forwarded +%llu, swaps +%llu, last callback %llu ms ago over %d ms)\n",
                      context,
-                     (unsigned long long)(finalCount - callbacksBeforeInit),
-                     MAX_WAIT_MS);
+                     sustained ? "data health OK" : "DATA HEALTH FAIL during sustain window",
+                     (unsigned long long)(forwardedNow - forwardedAtSustainStart),
+                     (unsigned long long)(swapsNow - swapsAtSustainStart),
+                     (unsigned long long)callbackAge,
+                     SUSTAIN_MS);
         std::fflush(stderr);
-        return false;
+        return sustained;
     }
 
     bool initFreshSelectedDevice(const char* context) {
@@ -740,28 +775,44 @@ private:
             return false;
         }
 
-        const uint64_t callbacksBeforeInit = streamCallbackCount.load();
+        // The callback starts as part of Init(). Prepare the SDR++ output path before
+        // calling Init so health validation observes samples that actually reach the DSP
+        // pipeline rather than callbacks that are discarded while running == false.
+        bufferIndex = 0;
+        bufferSize = (float)sampleRate / 200.0f;
+        sampleSequenceValid = false;
+        stream.clearWriteStop();
+        const uint64_t forwardedBeforeInit = forwardedCallbackCount.load();
+        const uint64_t swapsBeforeInit = successfulSwapCount.load();
+        acceptSamples.store(true);
+
         err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
         if (err != sdrplay_api_Success) {
+            acceptSamples.store(false);
+            stream.stopWriter();
             flog::error("[SDRplay diag] {0}: Init failed: {1}",
                         context, sdrplay_api_GetErrorString(err));
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
             flog::warn("[SDRplay diag] {0}: ReleaseDevice after Init failure: {1}",
                        context, sdrplay_api_GetErrorString(releaseErr));
+            stream.clearWriteStop();
             return false;
         }
 
-        if (!waitForHealthyCallbackFlow(context, callbacksBeforeInit)) {
+        if (!waitForHealthyDataFlow(context, forwardedBeforeInit, swapsBeforeInit)) {
+            acceptSamples.store(false);
+            stream.stopWriter();
             sdrplay_api_ErrT uninitErr = sdrplay_api_Uninit(openDev.dev);
-            flog::warn("[SDRplay diag] {0}: Uninit after stream health failure: {1}",
+            flog::warn("[SDRplay diag] {0}: Uninit after data health failure: {1}",
                        context, sdrplay_api_GetErrorString(uninitErr));
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
-            flog::warn("[SDRplay diag] {0}: ReleaseDevice after stream health failure: {1}",
+            flog::warn("[SDRplay diag] {0}: ReleaseDevice after data health failure: {1}",
                        context, sdrplay_api_GetErrorString(releaseErr));
+            stream.clearWriteStop();
             return false;
         }
 
-        flog::info("[SDRplay diag] {0}: Init succeeded with healthy callback flow", context);
+        flog::info("[SDRplay diag] {0}: Init succeeded with healthy forwarded data", context);
         return true;
     }
 
@@ -840,28 +891,41 @@ private:
             return false;
         }
 
-        const uint64_t callbacksBeforeInit = streamCallbackCount.load();
+        bufferIndex = 0;
+        bufferSize = (float)sampleRate / 200.0f;
+        sampleSequenceValid = false;
+        stream.clearWriteStop();
+        const uint64_t forwardedBeforeInit = forwardedCallbackCount.load();
+        const uint64_t swapsBeforeInit = successfulSwapCount.load();
+        acceptSamples.store(true);
+
         err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
         if (err != sdrplay_api_Success) {
+            acceptSamples.store(false);
+            stream.stopWriter();
             flog::error("[SDRplay diag] HARD RECOVERY: Init failed: {0}",
                         sdrplay_api_GetErrorString(err));
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
             flog::warn("[SDRplay diag] HARD RECOVERY: ReleaseDevice after Init failure: {0}",
                        sdrplay_api_GetErrorString(releaseErr));
+            stream.clearWriteStop();
             return false;
         }
 
-        if (!waitForHealthyCallbackFlow("HARD RECOVERY", callbacksBeforeInit)) {
+        if (!waitForHealthyDataFlow("HARD RECOVERY", forwardedBeforeInit, swapsBeforeInit)) {
+            acceptSamples.store(false);
+            stream.stopWriter();
             sdrplay_api_ErrT uninitErr = sdrplay_api_Uninit(openDev.dev);
-            flog::warn("[SDRplay diag] HARD RECOVERY: Uninit after stream health failure: {0}",
+            flog::warn("[SDRplay diag] HARD RECOVERY: Uninit after data health failure: {0}",
                        sdrplay_api_GetErrorString(uninitErr));
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
-            flog::warn("[SDRplay diag] HARD RECOVERY: ReleaseDevice after stream health failure: {0}",
+            flog::warn("[SDRplay diag] HARD RECOVERY: ReleaseDevice after data health failure: {0}",
                        sdrplay_api_GetErrorString(releaseErr));
+            stream.clearWriteStop();
             return false;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] HARD RECOVERY SUCCESS: fresh API session initialized with healthy callbacks\n");
+        std::fprintf(stderr, "[SDRplay diag] HARD RECOVERY SUCCESS: fresh API session initialized with healthy forwarded data\n");
         std::fflush(stderr);
         return true;
     }
@@ -949,9 +1013,8 @@ private:
 
         _this->channelParams = _this->openDevParams->rxChannelA;
 
-        // Configure device
-        _this->bufferIndex = 0;
-        _this->bufferSize = (float)_this->sampleRate / 200.0f;
+        // The sample buffer was initialized before Init so callbacks could be validated
+        // against the real SDR++ DSP path.
 
         // RSP1A Options
         if (_this->openDev.hwVer == SDRPLAY_RSP1A_ID || _this->openDev.hwVer == SDRPLAY_RSP1B_ID) {
@@ -1039,6 +1102,7 @@ private:
 
         flog::info("[SDRplay diag] Stop requested");
         _this->running = false;
+        _this->acceptSamples.store(false);
         _this->stream.stopWriter();
 
         // Release device after stopping
@@ -1557,6 +1621,8 @@ private:
             std::fflush(stderr);
         }
 
+        if (!_this->acceptSamples.load()) { return; }
+
         if (_this->sampleSequenceValid && params->firstSampleNum != _this->expectedSampleNum) {
             const unsigned int delta = params->firstSampleNum - _this->expectedSampleNum;
             std::fprintf(stderr,
@@ -1569,7 +1635,6 @@ private:
         _this->sampleSequenceValid = true;
 
         // TODO: Optimise using volk and math
-        if (!_this->running) { return; }
         for (int i = 0; i < numSamples; i++) {
             int id = _this->bufferIndex++;
             _this->stream.writeBuf[id].re = (float)xi[i] / 32768.0f;
@@ -1598,8 +1663,10 @@ private:
 
                 _this->bufferIndex = 0;
                 if (!swapped) { return; }
+                _this->successfulSwapCount.fetch_add(1);
             }
         }
+        _this->forwardedCallbackCount.fetch_add(1);
     }
 
     static void eventCB(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner,
@@ -1658,6 +1725,9 @@ private:
     std::atomic<bool> watchdogStop{false};
     std::atomic<uint64_t> lastStreamCallbackMs{0};
     std::atomic<uint64_t> streamCallbackCount{0};
+    std::atomic<uint64_t> forwardedCallbackCount{0};
+    std::atomic<uint64_t> successfulSwapCount{0};
+    std::atomic<bool> acceptSamples{false};
     std::atomic<bool> inStreamSwap{false};
     std::atomic<uint64_t> streamSwapStartMs{0};
     std::atomic<uint64_t> gainChangeSequence{0};
