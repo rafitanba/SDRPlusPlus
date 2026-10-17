@@ -5,6 +5,10 @@
 #include "../convert/mono_to_stereo.h"
 #include "../filter/fir.h"
 #include "../taps/low_pass.h"
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <cstdint>
 
 namespace dsp::demod {
     template <class T>
@@ -44,6 +48,10 @@ namespace dsp::demod {
             lpf.out.free();
             
             base_type::init(in);
+        }
+
+        void setDiagnosticName(const std::string& name) {
+            diagnosticName = name;
         }
 
         void setAGCMode(AGCMode agcMode) {
@@ -136,10 +144,43 @@ namespace dsp::demod {
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
 
+            if (!firstInputReported) {
+                std::fprintf(stderr,
+                             "[DSP diag] AM demod %s received first input block: count=%d samplerate=%.0f bandwidth=%.0f\n",
+                             diagnosticName.empty() ? "<unnamed>" : diagnosticName.c_str(),
+                             count, _samplerate, _bandwidth);
+                std::fflush(stderr);
+                firstInputReported = true;
+            }
+
             process(count, base_type::_in->readBuf, base_type::out.writeBuf);
 
             base_type::_in->flush();
-            if (!base_type::out.swap(count)) { return -1; }
+            const auto result = base_type::out.swapFor(count, std::chrono::milliseconds(20));
+            if (result == stream<T>::TimedSwapResult::STOPPED) {
+                return -1;
+            }
+            if (result == stream<T>::TimedSwapResult::TIMEOUT) {
+                outputTimeouts++;
+                if (outputTimeouts == 1 || (outputTimeouts % 200) == 0) {
+                    std::fprintf(stderr,
+                                 "[DSP diag] AM demod %s DROP: downstream audio chain did not consume output within 20 ms, count=%d consecutiveDrops=%llu\n",
+                                 diagnosticName.empty() ? "<unnamed>" : diagnosticName.c_str(),
+                                 count,
+                                 (unsigned long long)outputTimeouts);
+                    std::fflush(stderr);
+                }
+                return count;
+            }
+
+            if (outputTimeouts != 0) {
+                std::fprintf(stderr,
+                             "[DSP diag] AM demod %s downstream audio recovered after %llu dropped block(s)\n",
+                             diagnosticName.empty() ? "<unnamed>" : diagnosticName.c_str(),
+                             (unsigned long long)outputTimeouts);
+                std::fflush(stderr);
+                outputTimeouts = 0;
+            }
             return count;
         }
 
@@ -155,6 +196,10 @@ namespace dsp::demod {
         tap<float> lpfTaps;
         filter::FIR<float, float> lpf;
         std::mutex lpfMtx;
+
+        std::string diagnosticName;
+        bool firstInputReported = false;
+        uint64_t outputTimeouts = 0;
 
     };
 }
