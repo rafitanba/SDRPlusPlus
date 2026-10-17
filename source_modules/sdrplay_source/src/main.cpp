@@ -8,6 +8,7 @@
 #include <config.h>
 #include <sdrplay_api.h>
 #include <gui/smgui.h>
+#include <chrono>
 #include <utils/optionlist.h>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -150,7 +151,12 @@ public:
 
         sdrplay_api_DeviceT devArr[MAX_DEV_COUNT];
         unsigned int numDev = 0;
-        sdrplay_api_GetDevices(devArr, &numDev, MAX_DEV_COUNT);
+        sdrplay_api_ErrT err = sdrplay_api_GetDevices(devArr, &numDev, MAX_DEV_COUNT);
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] GetDevices failed: {0}", sdrplay_api_GetErrorString(err));
+            return;
+        }
+        flog::info("[SDRplay diag] GetDevices returned {0} device(s)", numDev);
 
         for (unsigned int i = 0; i < numDev; i++) {
             devList.push_back(devArr[i]);
@@ -239,13 +245,23 @@ public:
             return;
         }
 
-        sdrplay_api_UnlockDeviceApi();
-        sdrplay_api_DebugEnable(openDev.dev, sdrplay_api_DbgLvl_Message);
+        err = sdrplay_api_UnlockDeviceApi();
+        if (err != sdrplay_api_Success) {
+            flog::warn("[SDRplay diag] UnlockDeviceApi after SelectDevice returned: {0}", sdrplay_api_GetErrorString(err));
+        }
+
+        err = sdrplay_api_DebugEnable(openDev.dev, sdrplay_api_DbgLvl_Message);
+        if (err != sdrplay_api_Success) {
+            flog::warn("[SDRplay diag] DebugEnable returned: {0}", sdrplay_api_GetErrorString(err));
+        }
 
         err = sdrplay_api_GetDeviceParams(openDev.dev, &openDevParams);
         if (err != sdrplay_api_Success) {
             const char* errStr = sdrplay_api_GetErrorString(err);
             flog::error("Could not get device params for RSP device: {0}", errStr);
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] ReleaseDevice after GetDeviceParams failure: {0}",
+                       sdrplay_api_GetErrorString(releaseErr));
             selectedName = "";
             return;
         }
@@ -254,9 +270,13 @@ public:
         if (err != sdrplay_api_Success) {
             const char* errStr = sdrplay_api_GetErrorString(err);
             flog::error("Could not init RSP device: {0}", errStr);
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] ReleaseDevice after Init failure: {0}",
+                       sdrplay_api_GetErrorString(releaseErr));
             selectedName = "";
             return;
         }
+        flog::info("[SDRplay diag] Device Init succeeded during selection");
 
         // Define the valid samplerates
         samplerates.clear();
@@ -434,8 +454,10 @@ public:
         if (lnaGain >= lnaSteps) { lnaGain = lnaSteps - 1; }
 
         // Release device after selecting
-        sdrplay_api_Uninit(openDev.dev);
-        sdrplay_api_ReleaseDevice(&openDev);
+        err = sdrplay_api_Uninit(openDev.dev);
+        flog::info("[SDRplay diag] Uninit after device selection: {0}", sdrplay_api_GetErrorString(err));
+        err = sdrplay_api_ReleaseDevice(&openDev);
+        flog::info("[SDRplay diag] ReleaseDevice after device selection: {0}", sdrplay_api_GetErrorString(err));
     }
 
     void rspDuoSelectTuner(sdrplay_api_TunerSelectT tuner, sdrplay_api_RspDuo_AmPortSelectT amPort) {
@@ -508,13 +530,23 @@ private:
             return;
         }
 
-        sdrplay_api_UnlockDeviceApi();
-        sdrplay_api_DebugEnable(_this->openDev.dev, sdrplay_api_DbgLvl_Message);
+        err = sdrplay_api_UnlockDeviceApi();
+        if (err != sdrplay_api_Success) {
+            flog::warn("[SDRplay diag] UnlockDeviceApi at Start returned: {0}", sdrplay_api_GetErrorString(err));
+        }
+
+        err = sdrplay_api_DebugEnable(_this->openDev.dev, sdrplay_api_DbgLvl_Message);
+        if (err != sdrplay_api_Success) {
+            flog::warn("[SDRplay diag] DebugEnable at Start returned: {0}", sdrplay_api_GetErrorString(err));
+        }
 
         err = sdrplay_api_GetDeviceParams(_this->openDev.dev, &_this->openDevParams);
         if (err != sdrplay_api_Success) {
             const char* errStr = sdrplay_api_GetErrorString(err);
             flog::error("Could not get device params for RSP device: {0}", errStr);
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&_this->openDev);
+            flog::warn("[SDRplay diag] ReleaseDevice after Start/GetDeviceParams failure: {0}",
+                       sdrplay_api_GetErrorString(releaseErr));
             _this->selectedName = "";
             return;
         }
@@ -523,9 +555,13 @@ private:
         if (err != sdrplay_api_Success) {
             const char* errStr = sdrplay_api_GetErrorString(err);
             flog::error("Could not init RSP device: {0}", errStr);
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&_this->openDev);
+            flog::warn("[SDRplay diag] ReleaseDevice after Start/Init failure: {0}",
+                       sdrplay_api_GetErrorString(releaseErr));
             _this->selectedName = "";
             return;
         }
+        flog::info("[SDRplay diag] Device Init succeeded at Start");
 
         _this->channelParams = _this->openDevParams->rxChannelA;
 
@@ -619,12 +655,17 @@ private:
     static void stop(void* ctx) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
         if (!_this->running) { return; }
+
+        flog::info("[SDRplay diag] Stop requested");
         _this->running = false;
         _this->stream.stopWriter();
 
         // Release device after stopping
-        sdrplay_api_Uninit(_this->openDev.dev);
-        sdrplay_api_ReleaseDevice(&_this->openDev);
+        sdrplay_api_ErrT err = sdrplay_api_Uninit(_this->openDev.dev);
+        flog::info("[SDRplay diag] Uninit at Stop returned: {0}", sdrplay_api_GetErrorString(err));
+
+        err = sdrplay_api_ReleaseDevice(&_this->openDev);
+        flog::info("[SDRplay diag] ReleaseDevice at Stop returned: {0}", sdrplay_api_GetErrorString(err));
 
         _this->stream.clearWriteStop();
         flog::info("SDRPlaySourceModule '{0}': Stop!", _this->name);
@@ -1094,6 +1135,11 @@ private:
     static void streamCB(short* xi, short* xq, sdrplay_api_StreamCbParamsT* params,
                          unsigned int numSamples, unsigned int reset, void* cbContext) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)cbContext;
+
+        if (reset) {
+            flog::warn("[SDRplay diag] Stream callback reset={0}, numSamples={1}", reset, numSamples);
+        }
+
         // TODO: Optimise using volk and math
         if (!_this->running) { return; }
         for (int i = 0; i < numSamples; i++) {
@@ -1102,8 +1148,18 @@ private:
             _this->stream.writeBuf[id].im = (float)xq[i] / 32768.0f;
 
             if (_this->bufferIndex >= _this->bufferSize) {
-                _this->stream.swap(_this->bufferSize);
+                const auto swapStart = std::chrono::steady_clock::now();
+                const bool swapped = _this->stream.swap(_this->bufferSize);
+                const auto swapTime = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - swapStart).count();
+
+                if (!swapped || swapTime >= 20000) {
+                    flog::warn("[SDRplay diag] stream.swap result={0}, blocked={1} us, running={2}",
+                               swapped, swapTime, _this->running);
+                }
+
                 _this->bufferIndex = 0;
+                if (!swapped) { return; }
             }
         }
     }
@@ -1111,6 +1167,18 @@ private:
     static void eventCB(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner,
                         sdrplay_api_EventParamsT* params, void* cbContext) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)cbContext;
+
+        if (eventId == sdrplay_api_DeviceRemoved) {
+            flog::error("[SDRplay diag] API event: DeviceRemoved, tuner={0}, running={1}",
+                        (int)tuner, _this->running);
+            return;
+        }
+
+        // GainChange (0) can be very frequent with AGC, so avoid logging it.
+        if ((int)eventId != 0) {
+            flog::warn("[SDRplay diag] API event id={0}, tuner={1}, running={2}",
+                       (int)eventId, (int)tuner, _this->running);
+        }
     }
 
     std::string name;
