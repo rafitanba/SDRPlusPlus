@@ -101,7 +101,7 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] lifecycle-v6: metadata-only selection + pre-Init RSP1B config + API recovery\n");
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v7: stream-health validation + API recovery + metadata-only selection\n");
         std::fflush(stderr);
 
         sampleRate = 2000000.0;
@@ -682,6 +682,36 @@ private:
         return true;
     }
 
+    bool waitForHealthyCallbackFlow(const char* context, uint64_t callbacksBeforeInit) {
+        // A healthy 6 MS/s RSP1B produces callbacks very rapidly. We only require a tiny
+        // number so this remains conservative at lower sample rates.
+        constexpr uint64_t MIN_CALLBACKS = 8;
+        constexpr int MAX_WAIT_MS = 750;
+
+        for (int waited = 0; waited < MAX_WAIT_MS; waited += 10) {
+            const uint64_t nowCount = streamCallbackCount.load();
+            if (nowCount >= callbacksBeforeInit + MIN_CALLBACKS) {
+                std::fprintf(stderr,
+                             "[SDRplay diag] %s: stream health OK (%llu callbacks after Init in <=%d ms)\n",
+                             context,
+                             (unsigned long long)(nowCount - callbacksBeforeInit),
+                             waited + 10);
+                std::fflush(stderr);
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        const uint64_t finalCount = streamCallbackCount.load();
+        std::fprintf(stderr,
+                     "[SDRplay diag] %s: STREAM HEALTH FAIL (%llu callbacks in %d ms after successful Init)\n",
+                     context,
+                     (unsigned long long)(finalCount - callbacksBeforeInit),
+                     MAX_WAIT_MS);
+        std::fflush(stderr);
+        return false;
+    }
+
     bool initFreshSelectedDevice(const char* context) {
         if (!selectFreshDeviceBySerial(selectedSerial, openDev, context)) {
             return false;
@@ -710,6 +740,7 @@ private:
             return false;
         }
 
+        const uint64_t callbacksBeforeInit = streamCallbackCount.load();
         err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
         if (err != sdrplay_api_Success) {
             flog::error("[SDRplay diag] {0}: Init failed: {1}",
@@ -720,7 +751,17 @@ private:
             return false;
         }
 
-        flog::info("[SDRplay diag] {0}: Init succeeded", context);
+        if (!waitForHealthyCallbackFlow(context, callbacksBeforeInit)) {
+            sdrplay_api_ErrT uninitErr = sdrplay_api_Uninit(openDev.dev);
+            flog::warn("[SDRplay diag] {0}: Uninit after stream health failure: {1}",
+                       context, sdrplay_api_GetErrorString(uninitErr));
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] {0}: ReleaseDevice after stream health failure: {1}",
+                       context, sdrplay_api_GetErrorString(releaseErr));
+            return false;
+        }
+
+        flog::info("[SDRplay diag] {0}: Init succeeded with healthy callback flow", context);
         return true;
     }
 
@@ -799,6 +840,7 @@ private:
             return false;
         }
 
+        const uint64_t callbacksBeforeInit = streamCallbackCount.load();
         err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
         if (err != sdrplay_api_Success) {
             flog::error("[SDRplay diag] HARD RECOVERY: Init failed: {0}",
@@ -809,7 +851,17 @@ private:
             return false;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] HARD RECOVERY SUCCESS: fresh API session initialized\n");
+        if (!waitForHealthyCallbackFlow("HARD RECOVERY", callbacksBeforeInit)) {
+            sdrplay_api_ErrT uninitErr = sdrplay_api_Uninit(openDev.dev);
+            flog::warn("[SDRplay diag] HARD RECOVERY: Uninit after stream health failure: {0}",
+                       sdrplay_api_GetErrorString(uninitErr));
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] HARD RECOVERY: ReleaseDevice after stream health failure: {0}",
+                       sdrplay_api_GetErrorString(releaseErr));
+            return false;
+        }
+
+        std::fprintf(stderr, "[SDRplay diag] HARD RECOVERY SUCCESS: fresh API session initialized with healthy callbacks\n");
         std::fflush(stderr);
         return true;
     }
@@ -1494,6 +1546,7 @@ private:
     static void streamCB(short* xi, short* xq, sdrplay_api_StreamCbParamsT* params,
                          unsigned int numSamples, unsigned int reset, void* cbContext) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)cbContext;
+        _this->streamCallbackCount.fetch_add(1);
         _this->lastStreamCallbackMs.store(monotonicMs());
 
         if (reset) {
@@ -1604,6 +1657,7 @@ private:
 
     std::atomic<bool> watchdogStop{false};
     std::atomic<uint64_t> lastStreamCallbackMs{0};
+    std::atomic<uint64_t> streamCallbackCount{0};
     std::atomic<bool> inStreamSwap{false};
     std::atomic<uint64_t> streamSwapStartMs{0};
     std::atomic<uint64_t> gainChangeSequence{0};
