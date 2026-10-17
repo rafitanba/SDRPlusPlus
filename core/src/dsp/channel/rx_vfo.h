@@ -1,6 +1,10 @@
 #pragma once
 #include "frequency_xlator.h"
 #include "../multirate/rational_resampler.h"
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <cstdint>
 
 namespace dsp::channel {
     class RxVFO : public Processor<complex_t, complex_t> {
@@ -30,6 +34,10 @@ namespace dsp::channel {
             filter.init(NULL, ftaps);
 
             base_type::init(in);
+        }
+
+        void setDiagnosticName(const std::string& name) {
+            diagnosticName = name;
         }
 
         void setInSamplerate(double inSamplerate) {
@@ -103,12 +111,46 @@ namespace dsp::channel {
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
 
+            if (!firstInputReported) {
+                std::fprintf(stderr,
+                             "[DSP diag] RxVFO %s received first input block: count=%d inRate=%.0f outRate=%.0f bandwidth=%.0f\n",
+                             diagnosticName.empty() ? "<unnamed>" : diagnosticName.c_str(),
+                             count, _inSamplerate, _outSamplerate, _bandwidth);
+                std::fflush(stderr);
+                firstInputReported = true;
+            }
+
             int outCount = process(count, base_type::_in->readBuf, out.writeBuf);
 
-            // Swap if some data was generated
+            // Release the IQ splitter input before waiting for the downstream demodulator.
             base_type::_in->flush();
+
             if (outCount) {
-                if (!out.swap(outCount)) { return -1; }
+                const auto result = out.swapFor(outCount, std::chrono::milliseconds(20));
+                if (result == stream<complex_t>::TimedSwapResult::STOPPED) {
+                    return -1;
+                }
+                if (result == stream<complex_t>::TimedSwapResult::TIMEOUT) {
+                    outputTimeouts++;
+                    if (outputTimeouts == 1 || (outputTimeouts % 200) == 0) {
+                        std::fprintf(stderr,
+                                     "[DSP diag] RxVFO %s DROP: downstream demod did not consume output within 20 ms, outCount=%d consecutiveDrops=%llu\n",
+                                     diagnosticName.empty() ? "<unnamed>" : diagnosticName.c_str(),
+                                     outCount,
+                                     (unsigned long long)outputTimeouts);
+                        std::fflush(stderr);
+                    }
+                    return outCount;
+                }
+
+                if (outputTimeouts != 0) {
+                    std::fprintf(stderr,
+                                 "[DSP diag] RxVFO %s downstream recovered after %llu dropped output block(s)\n",
+                                 diagnosticName.empty() ? "<unnamed>" : diagnosticName.c_str(),
+                                 (unsigned long long)outputTimeouts);
+                    std::fflush(stderr);
+                    outputTimeouts = 0;
+                }
             }
             return outCount;
         }
@@ -130,6 +172,10 @@ namespace dsp::channel {
         double _outSamplerate;
         double _bandwidth;
         double _offset;
+
+        std::string diagnosticName;
+        bool firstInputReported = false;
+        uint64_t outputTimeouts = 0;
 
         std::mutex filterMtx;
     };
