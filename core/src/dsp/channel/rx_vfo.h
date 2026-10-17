@@ -131,25 +131,16 @@ namespace dsp::channel {
                     return -1;
                 }
                 if (result == stream<complex_t>::TimedSwapResult::TIMEOUT) {
-                    outputTimeouts++;
-                    if (outputTimeouts == 1 || (outputTimeouts % 200) == 0) {
+                    totalOutputTimeouts++;
+                    if (totalOutputTimeouts == 1 || (totalOutputTimeouts % 1000) == 0) {
                         std::fprintf(stderr,
-                                     "[DSP diag] RxVFO %s DROP: downstream demod did not consume output within 20 ms, outCount=%d consecutiveDrops=%llu\n",
+                                     "[DSP diag] RxVFO %s DROP: downstream demod did not consume output within 20 ms, outCount=%d totalDrops=%llu\n",
                                      diagnosticName.empty() ? "<unnamed>" : diagnosticName.c_str(),
                                      outCount,
-                                     (unsigned long long)outputTimeouts);
+                                     (unsigned long long)totalOutputTimeouts);
                         std::fflush(stderr);
                     }
                     return outCount;
-                }
-
-                if (outputTimeouts != 0) {
-                    std::fprintf(stderr,
-                                 "[DSP diag] RxVFO %s downstream recovered after %llu dropped output block(s)\n",
-                                 diagnosticName.empty() ? "<unnamed>" : diagnosticName.c_str(),
-                                 (unsigned long long)outputTimeouts);
-                    std::fflush(stderr);
-                    outputTimeouts = 0;
                 }
             }
             return outCount;
@@ -175,7 +166,7 @@ namespace dsp::channel {
 
         std::string diagnosticName;
         bool firstInputReported = false;
-        uint64_t outputTimeouts = 0;
+        uint64_t totalOutputTimeouts = 0;
 
         std::mutex filterMtx;
     };
