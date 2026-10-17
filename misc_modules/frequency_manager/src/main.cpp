@@ -13,6 +13,7 @@
 #include <utils/freq_formatting.h>
 #include <gui/dialogs/dialog_box.h>
 #include <fstream>
+#include <algorithm>
 #include <limits>
 
 SDRPP_MOD_INFO{
