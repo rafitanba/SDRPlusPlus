@@ -3,6 +3,7 @@
 #include <imgui/imgui.h>
 #include <gui/style.h>
 #include <gui/icons.h>
+#include <cstdio>
 
 #include <core.h>
 
@@ -33,9 +34,11 @@ void SinkManager::Stream::start() {
         return;
     }
 
-    splitter.start();
-    volumeAjust.start();
+    // Start downstream first. This guarantees that the first audio buffer always has
+    // a consumer before upstream blocks begin producing data.
     sink->start();
+    volumeAjust.start();
+    splitter.start();
     running = true;
 }
 
@@ -43,6 +46,9 @@ void SinkManager::Stream::stop() {
     if (!running) {
         return;
     }
+
+    // Stop in the opposite order: first prevent new upstream data, then drain/stop
+    // the volume stage, and finally stop the concrete audio backend.
     splitter.stop();
     volumeAjust.stop();
     sink->stop();
@@ -91,7 +97,7 @@ void SinkManager::registerSinkProvider(std::string name, SinkProvider provider) 
         return;
     }
 
-    // Add the provider to the lists
+    // Add to the list
     providers[name] = provider;
     providerNames.push_back(name);
 
@@ -226,17 +232,41 @@ void SinkManager::setStreamSink(std::string name, std::string providerName) {
         return;
     }
 
-    if (stream->running) {
-        stream->sink->stop();
+    const bool wasRunning = stream->running;
+    std::fprintf(stderr,
+                 "[Sink diag] switch begin stream=%s from=%s to=%s running=%d\n",
+                 name.c_str(), stream->providerName.c_str(), providerName.c_str(),
+                 wasRunning ? 1 : 0);
+    std::fflush(stderr);
+
+    // Do not stop/delete only the backend while upstream audio blocks are still
+    // producing into it. That can leave the UI thread waiting in a backend stop.
+    // Quiesce the complete stream first, replace the backend, then restart from
+    // downstream to upstream.
+    if (wasRunning) {
+        stream->stop();
+        std::fprintf(stderr, "[Sink diag] stream fully stopped before backend replacement\n");
+        std::fflush(stderr);
     }
+
     delete stream->sink;
     stream->providerId = std::distance(providerNames.begin(), std::find(providerNames.begin(), providerNames.end(), providerName));
     stream->providerName = providerName;
     SinkManager::SinkProvider prov = providers[providerName];
     stream->sink = prov.create(stream, name, prov.ctx);
-    if (stream->running) {
-        stream->sink->start();
+
+    std::fprintf(stderr, "[Sink diag] backend created provider=%s\n", providerName.c_str());
+    std::fflush(stderr);
+
+    if (wasRunning) {
+        stream->start();
+        std::fprintf(stderr, "[Sink diag] stream restarted provider=%s\n", providerName.c_str());
+        std::fflush(stderr);
     }
+
+    std::fprintf(stderr, "[Sink diag] switch end stream=%s provider=%s\n",
+                 name.c_str(), providerName.c_str());
+    std::fflush(stderr);
 }
 
 void SinkManager::showVolumeSlider(std::string name, std::string prefix, float width, float btnHeight, int btnBorder, bool sameLine) {
@@ -309,16 +339,18 @@ void SinkManager::loadStreamConfig(std::string name) {
     if (providers.find(provName) == providers.end()) {
         provName = providerNames[0];
     }
-    if (stream->running) {
-        stream->sink->stop();
+
+    const bool wasRunning = stream->running;
+    if (wasRunning) {
+        stream->stop();
     }
     delete stream->sink;
     SinkManager::SinkProvider prov = providers[provName];
     stream->providerId = std::distance(providerNames.begin(), std::find(providerNames.begin(), providerNames.end(), provName));
     stream->providerName = provName;
     stream->sink = prov.create(stream, name, prov.ctx);
-    if (stream->running) {
-        stream->sink->start();
+    if (wasRunning) {
+        stream->start();
     }
     stream->setVolume(conf["volume"]);
     stream->volumeAjust.setMuted(conf["muted"]);
