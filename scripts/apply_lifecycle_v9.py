@@ -72,3 +72,4 @@ new = '''    static void tune(double freq, void* ctx) {
 
 text = replace_once(text, old, new, "tune block")
 PATH.write_text(text)
+# Triggered after the workflow was installed.
