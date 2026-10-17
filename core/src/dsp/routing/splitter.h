@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
 
 namespace dsp::routing {
     template <class T>
@@ -13,7 +14,7 @@ namespace dsp::routing {
 
         Splitter(stream<T>* in) { base_type::init(in); }
 
-        void setDiagnosticName(const std::string& name) { diagnosticName = name; }
+        void setDiagnosticName(const std::string& name) { diagnosticNames()[this] = name; }
 
         void bindStream(stream<T>* stream) {
             assert(base_type::_block_init);
@@ -26,20 +27,20 @@ namespace dsp::routing {
 
             // Add to the list
             const auto diagStart = std::chrono::steady_clock::now();
-            if (!diagnosticName.empty()) {
+            if (!getDiagnosticName().empty()) {
                 std::fprintf(stderr, "[DSP diag] Splitter %s bind begin stream=%p outputs=%zu\n",
-                             diagnosticName.c_str(), (void*)stream, streams.size());
+                             getDiagnosticName().c_str(), (void*)stream, streams.size());
                 std::fflush(stderr);
             }
             base_type::tempStop();
             base_type::registerOutput(stream);
             streams.push_back(stream);
             base_type::tempStart();
-            if (!diagnosticName.empty()) {
+            if (!getDiagnosticName().empty()) {
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - diagStart).count();
                 std::fprintf(stderr, "[DSP diag] Splitter %s bind end stream=%p outputs=%zu duration=%lld us\n",
-                             diagnosticName.c_str(), (void*)stream, streams.size(), (long long)us);
+                             getDiagnosticName().c_str(), (void*)stream, streams.size(), (long long)us);
                 std::fflush(stderr);
             }
         }
@@ -56,20 +57,20 @@ namespace dsp::routing {
 
             // Remove the stream while the splitter worker is stopped.
             const auto diagStart = std::chrono::steady_clock::now();
-            if (!diagnosticName.empty()) {
+            if (!getDiagnosticName().empty()) {
                 std::fprintf(stderr, "[DSP diag] Splitter %s unbind begin stream=%p outputs=%zu\n",
-                             diagnosticName.c_str(), (void*)stream, streams.size());
+                             getDiagnosticName().c_str(), (void*)stream, streams.size());
                 std::fflush(stderr);
             }
             base_type::tempStop();
             streams.erase(sit);
             base_type::unregisterOutput(stream);
             base_type::tempStart();
-            if (!diagnosticName.empty()) {
+            if (!getDiagnosticName().empty()) {
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - diagStart).count();
                 std::fprintf(stderr, "[DSP diag] Splitter %s unbind end stream=%p outputs=%zu duration=%lld us\n",
-                             diagnosticName.c_str(), (void*)stream, streams.size(), (long long)us);
+                             getDiagnosticName().c_str(), (void*)stream, streams.size(), (long long)us);
                 std::fflush(stderr);
             }
         }
@@ -85,10 +86,10 @@ namespace dsp::routing {
                 const bool swapped = stream->swap(count);
                 const auto swapUs = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - swapStart).count();
-                if (!diagnosticName.empty() && (!swapped || swapUs >= 5000)) {
+                if (!getDiagnosticName().empty() && (!swapped || swapUs >= 5000)) {
                     std::fprintf(stderr,
                                  "[DSP diag] Splitter %s output=%zu stream=%p swap=%d blocked=%lld us count=%d outputs=%zu\n",
-                                 diagnosticName.c_str(), outputIndex, (void*)stream, swapped ? 1 : 0,
+                                 getDiagnosticName().c_str(), outputIndex, (void*)stream, swapped ? 1 : 0,
                                  (long long)swapUs, count, streams.size());
                     std::fflush(stderr);
                 }
@@ -105,8 +106,19 @@ namespace dsp::routing {
         }
 
     protected:
+        static std::unordered_map<const Splitter<T>*, std::string>& diagnosticNames() {
+            static std::unordered_map<const Splitter<T>*, std::string> names;
+            return names;
+        }
+
+        const std::string& getDiagnosticName() const {
+            static const std::string empty;
+            auto& names = diagnosticNames();
+            auto it = names.find(this);
+            return (it == names.end()) ? empty : it->second;
+        }
+
         std::vector<stream<T>*> streams;
-        std::string diagnosticName;
 
     };
 }
