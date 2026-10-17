@@ -101,7 +101,7 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] lifecycle-v3: fresh enumeration + one automatic Init retry\n");
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v3: fresh enumeration + Init retry + overload ACK/sample-gap diagnostics\n");
         std::fflush(stderr);
 
         sampleRate = 2000000.0;
@@ -1324,9 +1324,23 @@ private:
         _this->lastStreamCallbackMs.store(monotonicMs());
 
         if (reset) {
-            std::fprintf(stderr, "[SDRplay diag] Stream callback reset=%u, numSamples=%u\n", reset, numSamples);
+            _this->sampleSequenceValid = false;
+            std::fprintf(stderr,
+                         "[SDRplay diag] Stream callback reset=%u, firstSample=%u, numSamples=%u\n",
+                         reset, params->firstSampleNum, numSamples);
             std::fflush(stderr);
         }
+
+        if (_this->sampleSequenceValid && params->firstSampleNum != _this->expectedSampleNum) {
+            const unsigned int delta = params->firstSampleNum - _this->expectedSampleNum;
+            std::fprintf(stderr,
+                         "[SDRplay diag] SAMPLE GAP: expected=%u actual=%u delta=%u numSamples=%u grChanged=%d rfChanged=%d fsChanged=%d\n",
+                         _this->expectedSampleNum, params->firstSampleNum, delta, numSamples,
+                         params->grChanged, params->rfChanged, params->fsChanged);
+            std::fflush(stderr);
+        }
+        _this->expectedSampleNum = params->firstSampleNum + numSamples;
+        _this->sampleSequenceValid = true;
 
         // TODO: Optimise using volk and math
         if (!_this->running) { return; }
@@ -1363,6 +1377,26 @@ private:
                         sdrplay_api_EventParamsT* params, void* cbContext) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)cbContext;
 
+        if (eventId == sdrplay_api_PowerOverloadChange) {
+            const auto overloadType = params->powerOverloadParams.powerOverloadChangeType;
+            const char* overloadText =
+                (overloadType == sdrplay_api_Overload_Detected) ? "detected" : "corrected";
+
+            // SDRplay's API specification/example requires every overload event to be acknowledged.
+            const sdrplay_api_ErrT ackErr = sdrplay_api_Update(
+                _this->openDev.dev,
+                tuner,
+                sdrplay_api_Update_Ctrl_OverloadMsgAck,
+                sdrplay_api_Update_Ext1_None);
+
+            std::fprintf(stderr,
+                         "[SDRplay diag] API event: PowerOverloadChange=%s, ack=%s, tuner=%d, running=%d\n",
+                         overloadText, sdrplay_api_GetErrorString(ackErr),
+                         (int)tuner, _this->running ? 1 : 0);
+            std::fflush(stderr);
+            return;
+        }
+
         if (eventId == sdrplay_api_DeviceRemoved) {
             std::fprintf(stderr, "[SDRplay diag] API event: DeviceRemoved, tuner=%d, running=%d\n",
                          (int)tuner, _this->running ? 1 : 0);
@@ -1392,6 +1426,9 @@ private:
     std::atomic<bool> inStreamSwap{false};
     std::atomic<uint64_t> streamSwapStartMs{0};
     std::thread watchdogThread;
+
+    unsigned int expectedSampleNum = 0;
+    bool sampleSequenceValid = false;
 
     sdrplay_api_CallbackFnsT cbFuncs;
 
