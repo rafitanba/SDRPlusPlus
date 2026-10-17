@@ -101,7 +101,7 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] lifecycle-v8: forwarded-data health validation + API recovery\n");
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v9: forwarded-data validation + redundant-tune guard + API recovery\n");
         std::fflush(stderr);
 
         sampleRate = 2000000.0;
@@ -1118,11 +1118,40 @@ private:
 
     static void tune(double freq, void* ctx) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
-        if (_this->running) {
-            _this->channelParams->tunerParams.rfFreq.rfHz = freq;
-            sdrplay_api_Update(_this->openDev.dev, _this->openDev.tuner, sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None);
-        }
+        const double previousFreq = _this->freq;
         _this->freq = freq;
+
+        if (_this->running) {
+            double delta = freq - previousFreq;
+            if (delta < 0.0) { delta = -delta; }
+
+            // MainWindow calls tune() immediately after start(), even though the same RF
+            // frequency was already supplied before Init. Avoid a redundant Frf update at
+            // exactly the point where otherwise healthy callback flow has been disappearing.
+            if (delta < 1.0) {
+                std::fprintf(stderr,
+                             "[SDRplay diag] Tune skipped: unchanged RF %.0f Hz (callbacks=%llu swaps=%llu)\n",
+                             freq,
+                             (unsigned long long)_this->streamCallbackCount.load(),
+                             (unsigned long long)_this->successfulSwapCount.load());
+                std::fflush(stderr);
+                return;
+            }
+
+            _this->channelParams->tunerParams.rfFreq.rfHz = freq;
+            const sdrplay_api_ErrT err = sdrplay_api_Update(
+                _this->openDev.dev,
+                _this->openDev.tuner,
+                sdrplay_api_Update_Tuner_Frf,
+                sdrplay_api_Update_Ext1_None);
+            std::fprintf(stderr,
+                         "[SDRplay diag] Tune update: %.0f -> %.0f Hz, result=%s, callbacks=%llu swaps=%llu\n",
+                         previousFreq, freq, sdrplay_api_GetErrorString(err),
+                         (unsigned long long)_this->streamCallbackCount.load(),
+                         (unsigned long long)_this->successfulSwapCount.load());
+            std::fflush(stderr);
+        }
+
         flog::info("SDRPlaySourceModule '{0}': Tune: {1}!", _this->name, freq);
     }
 
