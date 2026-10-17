@@ -9,6 +9,9 @@
 #include <sdrplay_api.h>
 #include <gui/smgui.h>
 #include <chrono>
+#include <atomic>
+#include <thread>
+#include <cstdio>
 #include <utils/optionlist.h>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -122,9 +125,52 @@ public:
         sigpath::sourceManager.registerSource("SDRplay", &handler);
 
         initOk = true;
+
+        watchdogThread = std::thread([this]() {
+            bool stallReported = false;
+            while (!watchdogStop.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                if (!running) {
+                    stallReported = false;
+                    continue;
+                }
+
+                const uint64_t now = monotonicMs();
+                const uint64_t lastCb = lastStreamCallbackMs.load();
+                const bool swapBlocked = inStreamSwap.load();
+                const uint64_t swapStart = streamSwapStartMs.load();
+
+                if (swapBlocked && swapStart != 0 && now > swapStart + 1000) {
+                    if (!stallReported) {
+                        std::fprintf(stderr,
+                                     "[SDRplay diag] WATCHDOG: stream.swap blocked for %llu ms; last stream callback %llu ms ago\n",
+                                     (unsigned long long)(now - swapStart),
+                                     (unsigned long long)(lastCb ? now - lastCb : 0));
+                        std::fflush(stderr);
+                        stallReported = true;
+                    }
+                }
+                else if (lastCb != 0 && now > lastCb + 2000) {
+                    if (!stallReported) {
+                        std::fprintf(stderr,
+                                     "[SDRplay diag] WATCHDOG: no stream callback for %llu ms (running=1, inSwap=%d)\n",
+                                     (unsigned long long)(now - lastCb),
+                                     swapBlocked ? 1 : 0);
+                        std::fflush(stderr);
+                        stallReported = true;
+                    }
+                }
+                else {
+                    stallReported = false;
+                }
+            }
+        });
     }
 
     ~SDRPlaySourceModule() {
+        watchdogStop.store(true);
+        if (watchdogThread.joinable()) { watchdogThread.join(); }
         stop(this);
         if (initOk) { sdrplay_api_Close(); }
         sigpath::sourceManager.unregisterSource("SDRplay");
@@ -488,6 +534,11 @@ public:
     }
 
 private:
+    static uint64_t monotonicMs() {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     std::string getBandwdithScaled(double bw) {
         char buf[1024];
         if (bw >= 1000000.0) {
@@ -561,7 +612,11 @@ private:
             _this->selectedName = "";
             return;
         }
-        flog::info("[SDRplay diag] Device Init succeeded at Start");
+        _this->lastStreamCallbackMs.store(monotonicMs());
+        _this->inStreamSwap.store(false);
+        _this->streamSwapStartMs.store(0);
+        std::fprintf(stderr, "[SDRplay diag] Device Init succeeded at Start\n");
+        std::fflush(stderr);
 
         _this->channelParams = _this->openDevParams->rxChannelA;
 
@@ -1135,9 +1190,11 @@ private:
     static void streamCB(short* xi, short* xq, sdrplay_api_StreamCbParamsT* params,
                          unsigned int numSamples, unsigned int reset, void* cbContext) {
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)cbContext;
+        _this->lastStreamCallbackMs.store(monotonicMs());
 
         if (reset) {
-            flog::warn("[SDRplay diag] Stream callback reset={0}, numSamples={1}", reset, numSamples);
+            std::fprintf(stderr, "[SDRplay diag] Stream callback reset=%u, numSamples=%u\n", reset, numSamples);
+            std::fflush(stderr);
         }
 
         // TODO: Optimise using volk and math
@@ -1149,13 +1206,20 @@ private:
 
             if (_this->bufferIndex >= _this->bufferSize) {
                 const auto swapStart = std::chrono::steady_clock::now();
+                _this->streamSwapStartMs.store(monotonicMs());
+                _this->inStreamSwap.store(true);
                 const bool swapped = _this->stream.swap(_this->bufferSize);
+                _this->inStreamSwap.store(false);
+                _this->streamSwapStartMs.store(0);
+
                 const auto swapTime = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - swapStart).count();
 
                 if (!swapped || swapTime >= 20000) {
-                    flog::warn("[SDRplay diag] stream.swap result={0}, blocked={1} us, running={2}",
-                               swapped, swapTime, _this->running);
+                    std::fprintf(stderr,
+                                 "[SDRplay diag] stream.swap result=%d, blocked=%lld us, running=%d\n",
+                                 swapped ? 1 : 0, (long long)swapTime, _this->running ? 1 : 0);
+                    std::fflush(stderr);
                 }
 
                 _this->bufferIndex = 0;
@@ -1169,15 +1233,17 @@ private:
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)cbContext;
 
         if (eventId == sdrplay_api_DeviceRemoved) {
-            flog::error("[SDRplay diag] API event: DeviceRemoved, tuner={0}, running={1}",
-                        (int)tuner, _this->running);
+            std::fprintf(stderr, "[SDRplay diag] API event: DeviceRemoved, tuner=%d, running=%d\n",
+                         (int)tuner, _this->running ? 1 : 0);
+            std::fflush(stderr);
             return;
         }
 
         // GainChange (0) can be very frequent with AGC, so avoid logging it.
         if ((int)eventId != 0) {
-            flog::warn("[SDRplay diag] API event id={0}, tuner={1}, running={2}",
-                       (int)eventId, (int)tuner, _this->running);
+            std::fprintf(stderr, "[SDRplay diag] API event id=%d, tuner=%d, running=%d\n",
+                         (int)eventId, (int)tuner, _this->running ? 1 : 0);
+            std::fflush(stderr);
         }
     }
 
@@ -1189,6 +1255,12 @@ private:
     bool running = false;
     double freq;
     bool initOk = false;
+
+    std::atomic<bool> watchdogStop{false};
+    std::atomic<uint64_t> lastStreamCallbackMs{0};
+    std::atomic<bool> inStreamSwap{false};
+    std::atomic<uint64_t> streamSwapStartMs{0};
+    std::thread watchdogThread;
 
     sdrplay_api_CallbackFnsT cbFuncs;
 
