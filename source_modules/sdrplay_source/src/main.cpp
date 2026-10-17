@@ -101,7 +101,7 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[SDRplay diag] lifecycle-v3: Init retry + overload ACK + sample gaps + serialized gain updates\n");
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v4: Init retry + API Close/Open recovery + overload ACK + sample gaps\n");
         std::fflush(stderr);
 
         sampleRate = 2000000.0;
@@ -631,6 +631,124 @@ private:
         return true;
     }
 
+    bool initFreshSelectedDevice(const char* context) {
+        if (!selectFreshDeviceBySerial(selectedSerial, openDev, context)) {
+            return false;
+        }
+
+        sdrplay_api_ErrT err = sdrplay_api_DebugEnable(openDev.dev, sdrplay_api_DbgLvl_Message);
+        if (err != sdrplay_api_Success) {
+            flog::warn("[SDRplay diag] {0}: DebugEnable returned: {1}",
+                       context, sdrplay_api_GetErrorString(err));
+        }
+
+        err = sdrplay_api_GetDeviceParams(openDev.dev, &openDevParams);
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] {0}: GetDeviceParams failed: {1}",
+                        context, sdrplay_api_GetErrorString(err));
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] {0}: ReleaseDevice after GetDeviceParams failure: {1}",
+                       context, sdrplay_api_GetErrorString(releaseErr));
+            return false;
+        }
+
+        err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] {0}: Init failed: {1}",
+                        context, sdrplay_api_GetErrorString(err));
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] {0}: ReleaseDevice after Init failure: {1}",
+                       context, sdrplay_api_GetErrorString(releaseErr));
+            return false;
+        }
+
+        flog::info("[SDRplay diag] {0}: Init succeeded", context);
+        return true;
+    }
+
+    bool hardResetApiSessionAndInit() {
+        std::fprintf(stderr,
+                     "[SDRplay diag] HARD RECOVERY: rebuilding SDRplay API session for serial %s\n",
+                     selectedSerial.c_str());
+        std::fflush(stderr);
+
+        sdrplay_api_ErrT err = sdrplay_api_Close();
+        flog::warn("[SDRplay diag] HARD RECOVERY: Close returned: {0}",
+                   sdrplay_api_GetErrorString(err));
+
+        if (err != sdrplay_api_Success && err != sdrplay_api_NotInitialised) {
+            flog::error("[SDRplay diag] HARD RECOVERY aborted: Close failed");
+            return false;
+        }
+
+        initOk = false;
+        openDev = {};
+        openDevParams = nullptr;
+        channelParams = nullptr;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        err = sdrplay_api_Open();
+        flog::warn("[SDRplay diag] HARD RECOVERY: Open returned: {0}",
+                   sdrplay_api_GetErrorString(err));
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] HARD RECOVERY aborted: Open failed");
+            return false;
+        }
+        initOk = true;
+
+        // SDRConnect visibly refreshes until a device appears. Give a freshly opened API
+        // session a short bounded re-enumeration window before declaring recovery failure.
+        bool selected = false;
+        for (int attempt = 1; attempt <= 8; attempt++) {
+            char context[96];
+            std::snprintf(context, sizeof(context), "HARD RECOVERY enumerate %d/8", attempt);
+            if (selectFreshDeviceBySerial(selectedSerial, openDev, context)) {
+                selected = true;
+                break;
+            }
+            if (attempt < 8) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+
+        if (!selected) {
+            flog::error("[SDRplay diag] HARD RECOVERY failed: serial {0} did not reappear",
+                        selectedSerial);
+            return false;
+        }
+
+        err = sdrplay_api_DebugEnable(openDev.dev, sdrplay_api_DbgLvl_Message);
+        if (err != sdrplay_api_Success) {
+            flog::warn("[SDRplay diag] HARD RECOVERY: DebugEnable returned: {0}",
+                       sdrplay_api_GetErrorString(err));
+        }
+
+        err = sdrplay_api_GetDeviceParams(openDev.dev, &openDevParams);
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] HARD RECOVERY: GetDeviceParams failed: {0}",
+                        sdrplay_api_GetErrorString(err));
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] HARD RECOVERY: ReleaseDevice after GetDeviceParams failure: {0}",
+                       sdrplay_api_GetErrorString(releaseErr));
+            return false;
+        }
+
+        err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
+        if (err != sdrplay_api_Success) {
+            flog::error("[SDRplay diag] HARD RECOVERY: Init failed: {0}",
+                        sdrplay_api_GetErrorString(err));
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] HARD RECOVERY: ReleaseDevice after Init failure: {0}",
+                       sdrplay_api_GetErrorString(releaseErr));
+            return false;
+        }
+
+        std::fprintf(stderr, "[SDRplay diag] HARD RECOVERY SUCCESS: fresh API session initialized\n");
+        std::fflush(stderr);
+        return true;
+    }
+
     static uint64_t monotonicMs() {
         return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -665,84 +783,41 @@ private:
         SDRPlaySourceModule* _this = (SDRPlaySourceModule*)ctx;
         if (_this->running) { return; }
 
-        // Re-enumerate and acquire a fresh device descriptor for every Start.
-        // This follows the SDRplay API sequence Lock -> GetDevices -> SelectDevice -> Unlock
-        // instead of reusing a descriptor cached during the menu-selection phase.
-        sdrplay_api_ErrT err;
         if (_this->selectedSerial.empty()) {
             flog::error("[SDRplay diag] Cannot Start: no selected SDRplay serial");
             return;
         }
 
-        if (!_this->selectFreshDeviceBySerial(_this->selectedSerial, _this->openDev, "Start")) {
-            flog::error("Could not select RSP device with serial {0}", _this->selectedSerial);
+        bool initialized = false;
+
+        if (!_this->initOk) {
+            // A previous hard recovery may have failed to reopen the API. Try rebuilding it
+            // directly instead of issuing calls against a known-closed session.
+            initialized = _this->hardResetApiSessionAndInit();
+        }
+        else {
+            initialized = _this->initFreshSelectedDevice("Start attempt 1");
+
+            if (!initialized) {
+                std::fprintf(stderr, "[SDRplay diag] Init retry scheduled after 500 ms\n");
+                std::fflush(stderr);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                initialized = _this->initFreshSelectedDevice("Start attempt 2");
+            }
+
+            if (!initialized) {
+                std::fprintf(stderr,
+                             "[SDRplay diag] Two normal Start attempts failed; escalating to API session reset\n");
+                std::fflush(stderr);
+                initialized = _this->hardResetApiSessionAndInit();
+            }
+        }
+
+        if (!initialized) {
+            flog::error("[SDRplay diag] Start failed after normal retries and hard API recovery");
             return;
         }
 
-        err = sdrplay_api_DebugEnable(_this->openDev.dev, sdrplay_api_DbgLvl_Message);
-        if (err != sdrplay_api_Success) {
-            flog::warn("[SDRplay diag] DebugEnable at Start returned: {0}", sdrplay_api_GetErrorString(err));
-        }
-
-        err = sdrplay_api_GetDeviceParams(_this->openDev.dev, &_this->openDevParams);
-        if (err != sdrplay_api_Success) {
-            const char* errStr = sdrplay_api_GetErrorString(err);
-            flog::error("Could not get device params for RSP device: {0}", errStr);
-            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&_this->openDev);
-            flog::warn("[SDRplay diag] ReleaseDevice after Start/GetDeviceParams failure: {0}",
-                       sdrplay_api_GetErrorString(releaseErr));
-            // Keep the selected device identity so Start can be retried after a transient API failure.
-            return;
-        }
-
-        err = sdrplay_api_Init(_this->openDev.dev, &_this->cbFuncs, _this);
-        if (err != sdrplay_api_Success) {
-            const char* errStr = sdrplay_api_GetErrorString(err);
-            flog::error("[SDRplay diag] Init attempt 1 failed: {0}", errStr);
-
-            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&_this->openDev);
-            flog::warn("[SDRplay diag] ReleaseDevice after Init attempt 1: {0}",
-                       sdrplay_api_GetErrorString(releaseErr));
-
-            std::fprintf(stderr, "[SDRplay diag] Init retry scheduled after 500 ms\n");
-            std::fflush(stderr);
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-            if (!_this->selectFreshDeviceBySerial(_this->selectedSerial, _this->openDev, "Start retry")) {
-                flog::error("[SDRplay diag] Init retry aborted: could not reselect serial {0}",
-                            _this->selectedSerial);
-                return;
-            }
-
-            err = sdrplay_api_DebugEnable(_this->openDev.dev, sdrplay_api_DbgLvl_Message);
-            if (err != sdrplay_api_Success) {
-                flog::warn("[SDRplay diag] DebugEnable at Start retry returned: {0}",
-                           sdrplay_api_GetErrorString(err));
-            }
-
-            err = sdrplay_api_GetDeviceParams(_this->openDev.dev, &_this->openDevParams);
-            if (err != sdrplay_api_Success) {
-                flog::error("[SDRplay diag] GetDeviceParams at Init retry failed: {0}",
-                            sdrplay_api_GetErrorString(err));
-                releaseErr = sdrplay_api_ReleaseDevice(&_this->openDev);
-                flog::warn("[SDRplay diag] ReleaseDevice after retry/GetDeviceParams failure: {0}",
-                           sdrplay_api_GetErrorString(releaseErr));
-                return;
-            }
-
-            err = sdrplay_api_Init(_this->openDev.dev, &_this->cbFuncs, _this);
-            if (err != sdrplay_api_Success) {
-                flog::error("[SDRplay diag] Init attempt 2 failed: {0}",
-                            sdrplay_api_GetErrorString(err));
-                releaseErr = sdrplay_api_ReleaseDevice(&_this->openDev);
-                flog::warn("[SDRplay diag] ReleaseDevice after Init attempt 2: {0}",
-                           sdrplay_api_GetErrorString(releaseErr));
-                return;
-            }
-
-            std::fprintf(stderr, "[SDRplay diag] Init attempt 2 succeeded\n");
-            std::fflush(stderr);
-        }
         _this->lastStreamCallbackMs.store(monotonicMs());
         _this->inStreamSwap.store(false);
         _this->streamSwapStartMs.store(0);
