@@ -101,6 +101,9 @@ public:
             return;
         }
 
+        std::fprintf(stderr, "[SDRplay diag] lifecycle-v2: locked fresh enumeration enabled\n");
+        std::fflush(stderr);
+
         sampleRate = 2000000.0;
         srId = 0;
 
