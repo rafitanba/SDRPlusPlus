@@ -309,13 +309,6 @@ public:
             return;
         }
 
-        if (!configureSelectedDeviceBeforeInit(context)) {
-            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
-            flog::warn("[SDRplay diag] {0}: ReleaseDevice after pre-Init configuration failure: {1}",
-                       context, sdrplay_api_GetErrorString(releaseErr));
-            return false;
-        }
-
         err = sdrplay_api_Init(openDev.dev, &cbFuncs, this);
         if (err != sdrplay_api_Success) {
             const char* errStr = sdrplay_api_GetErrorString(err);
@@ -716,6 +709,13 @@ private:
                         context, sdrplay_api_GetErrorString(err));
             sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
             flog::warn("[SDRplay diag] {0}: ReleaseDevice after GetDeviceParams failure: {1}",
+                       context, sdrplay_api_GetErrorString(releaseErr));
+            return false;
+        }
+
+        if (!configureSelectedDeviceBeforeInit(context)) {
+            sdrplay_api_ErrT releaseErr = sdrplay_api_ReleaseDevice(&openDev);
+            flog::warn("[SDRplay diag] {0}: ReleaseDevice after pre-Init configuration failure: {1}",
                        context, sdrplay_api_GetErrorString(releaseErr));
             return false;
         }
