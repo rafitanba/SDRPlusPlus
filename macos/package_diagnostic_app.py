@@ -101,10 +101,23 @@ def macho_files(app: Path) -> list[Path]:
 def dependencies(binary: Path) -> list[str]:
     output = run("otool", "-L", binary, capture=True)
     result: list[str] = []
-    for line in output.splitlines()[1:]:
+    seen: set[str] = set()
+
+    # Thin Mach-O files have one non-indented header. Universal files have one
+    # non-indented "<path> (architecture <arch>):" header per architecture.
+    # Dependency records are always indented, so parse only those records rather
+    # than assuming that exactly the first output line is a header.
+    for line in output.splitlines():
+        if not line[:1].isspace():
+            continue
         stripped = line.strip()
-        if stripped:
-            result.append(stripped.split(" (compatibility version", 1)[0])
+        if not stripped:
+            continue
+        dep = stripped.split(" (compatibility version", 1)[0]
+        if dep in seen:
+            continue
+        seen.add(dep)
+        result.append(dep)
     return result
 
 
